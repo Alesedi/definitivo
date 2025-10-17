@@ -65,6 +65,13 @@ class MLRecommendationService:
         self.n_components = 50
         self.n_clusters = 3
         
+        # Tracciamento fattore k (numero componenti SVD)
+        self.actual_k_used = 0  # Numero effettivo di componenti utilizzati
+        self.k_history = []  # Storico dei valori k testati
+        self.variance_per_component = []  # Varianza spiegata per ogni componente
+        self.optimal_k = None  # Valore k ottimale identificato
+        self.k_performance_log = {}  # Log performance per diversi k
+        
         # TMDB API per poster
         self.TMDB_API_KEY = "9e6c375b125d733d9ce459bdd91d4a06"
         self.TMDB_BASE_URL = "https://api.themoviedb.org/3/movie/{}/images?api_key={}"
@@ -137,6 +144,25 @@ class MLRecommendationService:
             max_components = max(1, min_dim - 1)  # Assicura almeno 1
             safe_components = min(self.n_components, max_components)
             
+            # 🔍 LOGGING DETTAGLIATO SCELTA FATTORE K
+            logger.info("=" * 60)
+            logger.info("🎯 PROCESSO SELEZIONE FATTORE K - SVD")
+            logger.info("=" * 60)
+            logger.info(f"📊 Matrice dati: {ratings_sparse.shape[0]} utenti × {ratings_sparse.shape[1]} film")
+            logger.info(f"📈 Densità matrice: {(len(df) / (ratings_sparse.shape[0] * ratings_sparse.shape[1]) * 100):.2f}%")
+            logger.info(f"🎛️  K richiesto dal modello: {self.n_components}")
+            logger.info(f"📏 Dimensione minima matrice: {min_dim}")
+            logger.info(f"🔝 Massimo K possibile: {max_components}")
+            logger.info(f"✅ K finale selezionato: {safe_components}")
+            
+            if safe_components < self.n_components:
+                logger.warning(f"⚠️  K ridotto da {self.n_components} a {safe_components} per limitazioni dati")
+            else:
+                logger.info(f"✅ K utilizzato come richiesto: {safe_components}")
+            
+            logger.info("🚀 Avvio decomposizione SVD...")
+            logger.info("-" * 60)
+            
             # Verifica diversità dati per Collaborative Filtering
             n_users = df['userId'].nunique()
             n_movies = df['movieId'].nunique()
@@ -153,10 +179,70 @@ class MLRecommendationService:
                 safe_components = 1  # Fallback a 1 componente
             
             # Training SVD
+            logger.info("🔄 Esecuzione TruncatedSVD...")
             self.svd_model = TruncatedSVD(n_components=safe_components, random_state=42)
+            logger.info("📊 Calcolo fattori latenti utenti...")
             self.user_factors = self.svd_model.fit_transform(ratings_sparse)
+            logger.info("🎬 Calcolo fattori latenti film...")
             self.movie_factors = self.svd_model.components_.T
             self.explained_variance = self.svd_model.explained_variance_ratio_.sum()
+            
+            logger.info("✅ SVD completata!")
+            logger.info(f"📈 Varianza totale spiegata: {self.explained_variance:.1%}")
+            logger.info(f"👥 Fattori utenti: {self.user_factors.shape}")
+            logger.info(f"🎭 Fattori film: {self.movie_factors.shape}")
+            
+            # Tracciamento dettagliato del fattore k
+            self.actual_k_used = safe_components
+            self.variance_per_component = self.svd_model.explained_variance_ratio_.tolist()
+            
+            # 📊 ANALISI COMPONENTI DETTAGLIATA
+            logger.info("=" * 60)
+            logger.info("📊 ANALISI DETTAGLIATA COMPONENTI SVD")
+            logger.info("=" * 60)
+            cumulative_var = 0
+            for i, var_ratio in enumerate(self.variance_per_component[:10]):  # Prime 10
+                cumulative_var += var_ratio
+                logger.info(f"Componente {i+1:2d}: {var_ratio:.4f} ({var_ratio*100:.2f}%) | Cumulativa: {cumulative_var:.4f} ({cumulative_var*100:.1f}%)")
+            
+            if len(self.variance_per_component) > 10:
+                logger.info(f"... e altre {len(self.variance_per_component) - 10} componenti")
+            
+            # Identifica elbow point in tempo reale
+            if len(self.variance_per_component) > 2:
+                differences = []
+                for i in range(1, len(self.variance_per_component)):
+                    diff = self.variance_per_component[i-1] - self.variance_per_component[i]
+                    differences.append(diff)
+                
+                if differences:
+                    max_diff = max(differences)
+                    elbow_point = None
+                    for i, diff in enumerate(differences):
+                        if diff < max_diff * 0.1:
+                            elbow_point = i + 1
+                            break
+                    
+                    if elbow_point:
+                        logger.info(f"📍 Elbow Point identificato: Componente {elbow_point}")
+                        if elbow_point < safe_components:
+                            logger.info(f"💡 Suggerimento: Potresti usare solo {elbow_point} componenti mantenendo {cumulative_var:.1%} della varianza")
+            
+            logger.info("-" * 60)
+            
+            # Log delle informazioni k
+            k_info = {
+                "requested_k": self.n_components,
+                "actual_k": self.actual_k_used,
+                "max_possible_k": max_components,
+                "total_explained_variance": float(self.explained_variance),
+                "variance_per_component": self.variance_per_component,
+                "matrix_shape": ratings_sparse.shape,
+                "data_sparsity": 1 - (len(df) / (ratings_sparse.shape[0] * ratings_sparse.shape[1]))
+            }
+            
+            logger.info(f"SVD Training - K Factor Details: {k_info}")
+            self.k_history.append(k_info)
             
             # Clustering dei film nello spazio latente
             if self.movie_factors.shape[0] > self.n_clusters and self.movie_factors.shape[1] >= 2:
@@ -183,6 +269,8 @@ class MLRecommendationService:
                 "unique_movies": df['movieId'].nunique(),
                 "explained_variance": float(self.explained_variance),
                 "n_components": self.svd_model.n_components,
+                "actual_k_used": self.actual_k_used,
+                "k_efficiency": float(self.explained_variance / self.actual_k_used) if self.actual_k_used > 0 else 0,
                 "training_status": "success"
             }
             
@@ -415,7 +503,7 @@ class MLRecommendationService:
             return {"error": str(e)}
 
     def get_model_status(self) -> Dict[str, Any]:
-        """Restituisce lo stato del modello"""
+        """Restituisce lo stato del modello con dettagli sul fattore k"""
         explained_var = 0.0
         if self.is_trained and self.explained_variance is not None:
             explained_var = float(self.explained_variance)
@@ -429,8 +517,13 @@ class MLRecommendationService:
             "is_trained": self.is_trained,
             "explained_variance": explained_var,
             "n_components": self.svd_model.n_components if self.svd_model else 0,
+            "actual_k_used": self.actual_k_used,
+            "requested_k": self.n_components,
+            "k_efficiency": float(explained_var / self.actual_k_used) if self.actual_k_used > 0 else 0,
             "n_clusters": self.n_clusters,
-            "has_clustering": self.kmeans_model is not None
+            "has_clustering": self.kmeans_model is not None,
+            "variance_per_component": self.variance_per_component if hasattr(self, 'variance_per_component') else [],
+            "k_optimization_available": len(self.k_performance_log) > 0 if hasattr(self, 'k_performance_log') else False
         }
 
     def _train_content_based_model(self, df: pd.DataFrame) -> Dict[str, Any]:
@@ -476,6 +569,303 @@ class MLRecommendationService:
         except Exception as e:
             logger.error(f"Error in content-based training: {e}")
             raise
+
+    def analyze_k_factor(self) -> Dict[str, Any]:
+        """
+        Analizza il fattore k utilizzato nella SVD e fornisce insights
+        
+        Returns:
+            Analisi dettagliata del fattore k e raccomandazioni
+        """
+        if not self.is_trained or not self.svd_model:
+            return {"error": "Model not trained or SVD not available"}
+        
+        try:
+            analysis = {
+                "current_k": self.actual_k_used,
+                "requested_k": self.n_components,
+                "max_possible_k": min(self.svd_model.n_features_in_, len(self.variance_per_component)),
+                "total_explained_variance": float(self.explained_variance),
+                "variance_per_component": self.variance_per_component,
+                "k_efficiency": float(self.explained_variance / self.actual_k_used) if self.actual_k_used > 0 else 0,
+                "cumulative_variance": [],
+                "elbow_point": None,
+                "recommended_k": None
+            }
+            
+            # Calcola varianza cumulativa
+            cumulative = 0
+            for i, var in enumerate(self.variance_per_component):
+                cumulative += var
+                analysis["cumulative_variance"].append({
+                    "component": i + 1,
+                    "individual_variance": float(var),
+                    "cumulative_variance": float(cumulative),
+                    "percentage": float(cumulative * 100)
+                })
+            
+            # Trova elbow point (punto di diminuzione significativa)
+            if len(self.variance_per_component) > 2:
+                differences = []
+                for i in range(1, len(self.variance_per_component)):
+                    diff = self.variance_per_component[i-1] - self.variance_per_component[i]
+                    differences.append(diff)
+                
+                if differences:
+                    # Trova il punto dove la differenza cala significativamente
+                    max_diff = max(differences)
+                    for i, diff in enumerate(differences):
+                        if diff < max_diff * 0.1:  # 10% del massimo
+                            analysis["elbow_point"] = i + 1
+                            break
+            
+            # Raccomandazione k ottimale
+            # Usa 95% della varianza come target
+            target_variance = 0.95
+            for item in analysis["cumulative_variance"]:
+                if item["cumulative_variance"] >= target_variance:
+                    analysis["recommended_k"] = item["component"]
+                    break
+            
+            # Se non raggiunge 95%, usa elbow point
+            if not analysis["recommended_k"] and analysis["elbow_point"]:
+                analysis["recommended_k"] = analysis["elbow_point"]
+            
+            # Fallback: usa 80% dei componenti attuali
+            if not analysis["recommended_k"]:
+                analysis["recommended_k"] = max(1, int(self.actual_k_used * 0.8))
+            
+            return analysis
+            
+        except Exception as e:
+            logger.error(f"Error analyzing k factor: {e}")
+            return {"error": str(e)}
+
+    def optimize_k_factor(self, k_range: List[int] = None) -> Dict[str, Any]:
+        """
+        Ottimizza il fattore k testando diversi valori
+        
+        Args:
+            k_range: Lista di valori k da testare (default: range automatico)
+            
+        Returns:
+            Risultati dell'ottimizzazione con k ottimale
+        """
+        if not self.is_trained:
+            return {"error": "Model not trained"}
+        
+        try:
+            # Prepara dati per test
+            df = self.prepare_data()
+            
+            if len(df) < 20:
+                return {"error": "Insufficient data for k optimization"}
+            
+            # Range automatico se non specificato
+            if k_range is None:
+                max_k = min(50, min(df['userId'].nunique(), df['movieId'].nunique()) - 1)
+                max_k = max(1, max_k)  # Assicura almeno 1
+                if max_k <= 3:
+                    k_range = list(range(1, max_k + 1))  # Per dataset piccoli
+                else:
+                    k_range = list(range(5, max_k + 1, 5))  # Step di 5 per dataset grandi
+            
+            results = []
+            best_score = float('inf')
+            best_k = None
+            
+            logger.info(f"Testing k values: {k_range}")
+            logger.info("=" * 80)
+            logger.info("🔬 OTTIMIZZAZIONE FATTORE K - PROCESSO DETTAGLIATO")
+            logger.info("=" * 80)
+            logger.info(f"🎯 Range K da testare: {k_range}")
+            logger.info(f"📊 Dataset: {len(df)} rating, {df['userId'].nunique()} utenti, {df['movieId'].nunique()} film")
+            logger.info("=" * 80)
+            
+            for k in k_range:
+                try:
+                    logger.info(f"\n🔍 TEST K = {k}")
+                    logger.info("-" * 40)
+                    
+                    # Encoding per test
+                    user_encoder_test = LabelEncoder()
+                    movie_encoder_test = LabelEncoder()
+                    
+                    df_test = df.copy()
+                    df_test['user_idx'] = user_encoder_test.fit_transform(df_test['userId'])
+                    df_test['movie_idx'] = movie_encoder_test.fit_transform(df_test['title'])
+                    
+                    # Split train/test
+                    train_df, test_df = train_test_split(df_test, test_size=0.2, random_state=42)
+                    logger.info(f"📚 Train set: {len(train_df)} rating")
+                    logger.info(f"🧪 Test set: {len(test_df)} rating")
+                    
+                    # Matrice training
+                    train_matrix = csr_matrix(
+                        (train_df['rating'], (train_df['user_idx'], train_df['movie_idx'])),
+                        shape=(df_test['user_idx'].nunique(), df_test['movie_idx'].nunique())
+                    )
+                    logger.info(f"🏗️  Matrice training: {train_matrix.shape}")
+                    
+                    # Test SVD con k componenti
+                    logger.info(f"⚙️  Esecuzione SVD con k={k}...")
+                    svd_test = TruncatedSVD(n_components=k, random_state=42)
+                    user_factors_test = svd_test.fit_transform(train_matrix)
+                    movie_factors_test = svd_test.components_.T
+                    
+                    explained_var = float(svd_test.explained_variance_ratio_.sum())
+                    logger.info(f"📈 Varianza spiegata: {explained_var:.1%}")
+                    
+                    # Valutazione
+                    logger.info("🎯 Generazione predizioni...")
+                    predictions, actuals = [], []
+                    test_sample = test_df.head(100)  # Limita per velocità
+                    
+                    for idx, (_, row) in enumerate(test_sample.iterrows()):
+                        u, m = row['user_idx'], row['movie_idx']
+                        if u < user_factors_test.shape[0] and m < movie_factors_test.shape[0]:
+                            pred = np.dot(user_factors_test[u], movie_factors_test[m])
+                            predictions.append(pred)
+                            actuals.append(row['rating'])
+                        
+                        # Progress indicator per test lunghi
+                        if idx % 25 == 0 and idx > 0:
+                            logger.info(f"   📊 Processate {idx}/{len(test_sample)} predizioni...")
+                    
+                    if len(predictions) > 5:
+                        rmse = float(np.sqrt(mean_squared_error(actuals, predictions)))
+                        mae = float(mean_absolute_error(actuals, predictions))
+                        
+                        # Score combinato (RMSE penalizzato + bonus varianza)
+                        combined_score = rmse - (explained_var * 0.5)
+                        
+                        result = {
+                            "k": k,
+                            "rmse": rmse,
+                            "mae": mae,
+                            "explained_variance": explained_var,
+                            "combined_score": combined_score,
+                            "test_predictions": len(predictions)
+                        }
+                        
+                        results.append(result)
+                        
+                        # 📊 LOG RISULTATI IN TEMPO REALE
+                        logger.info(f"✅ RISULTATI K={k}:")
+                        logger.info(f"   📉 RMSE: {rmse:.4f}")
+                        logger.info(f"   📊 MAE: {mae:.4f}")
+                        logger.info(f"   📈 Varianza: {explained_var:.1%}")
+                        logger.info(f"   🎯 Score Combinato: {combined_score:.4f}")
+                        logger.info(f"   🔢 Predizioni valide: {len(predictions)}")
+                        
+                        if combined_score < best_score:
+                            best_score = combined_score
+                            best_k = k
+                            logger.info(f"   🏆 NUOVO MIGLIOR K! ({k})")
+                        
+                    else:
+                        logger.warning(f"   ⚠️  Predizioni insufficienti per k={k} ({len(predictions)})")
+                    
+                except Exception as e:
+                    logger.error(f"   ❌ Errore testing k={k}: {e}")
+                    continue
+            
+            if results:
+                # Ordina per score
+                results.sort(key=lambda x: x["combined_score"])
+                
+                logger.info("\n" + "=" * 80)
+                logger.info("🏆 RISULTATI FINALI OTTIMIZZAZIONE")
+                logger.info("=" * 80)
+                logger.info(f"🥇 MIGLIOR K TROVATO: {best_k}")
+                logger.info(f"📊 K ATTUALE: {self.actual_k_used}")
+                logger.info(f"🔄 MIGLIORAMENTO POSSIBILE: {'SÌ' if best_k != self.actual_k_used else 'NO'}")
+                logger.info("\n🏅 TOP 5 CONFIGURAZIONI:")
+                logger.info("-" * 80)
+                logger.info("Pos | K   | RMSE   | MAE    | Varianza | Score")
+                logger.info("-" * 80)
+                
+                for i, result in enumerate(results[:5], 1):
+                    k = result['k']
+                    rmse = result['rmse']
+                    mae = result['mae']
+                    var = result['explained_variance']
+                    score = result['combined_score']
+                    marker = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else "📊"
+                    logger.info(f"{marker} {i:2d} | {k:3d} | {rmse:.4f} | {mae:.4f} | {var:.4f}   | {score:.4f}")
+                
+                logger.info("=" * 80)
+                
+                optimization_result = {
+                    "best_k": best_k,
+                    "current_k": self.actual_k_used,
+                    "improvement": best_k != self.actual_k_used,
+                    "all_results": results,
+                    "recommendation": f"Use k={best_k} for optimal performance"
+                }
+                
+                # Salva nel log delle performance
+                self.k_performance_log = {
+                    "timestamp": pd.Timestamp.now().isoformat(),
+                    "optimization_results": optimization_result
+                }
+                
+                logger.info(f"💡 RACCOMANDAZIONE: {optimization_result['recommendation']}")
+                return optimization_result
+            else:
+                logger.error("❌ Nessun risultato valido dall'ottimizzazione")
+                return {"error": "No valid results from k optimization"}
+            
+        except Exception as e:
+            logger.error(f"Error optimizing k factor: {e}")
+            return {"error": str(e)}
+
+    def get_k_factor_report(self) -> Dict[str, Any]:
+        """
+        Genera un report completo sul fattore k
+        
+        Returns:
+            Report dettagliato con analisi, storia e raccomandazioni
+        """
+        try:
+            report = {
+                "current_status": {
+                    "is_trained": self.is_trained,
+                    "current_k": self.actual_k_used,
+                    "requested_k": self.n_components,
+                    "explained_variance": float(self.explained_variance) if self.explained_variance else 0,
+                },
+                "k_analysis": self.analyze_k_factor() if self.is_trained else {},
+                "k_history": self.k_history,
+                "performance_log": self.k_performance_log,
+                "recommendations": []
+            }
+            
+            # Genera raccomandazioni
+            if self.is_trained:
+                if self.explained_variance < 0.5:
+                    report["recommendations"].append({
+                        "type": "warning",
+                        "message": f"Low explained variance ({self.explained_variance:.2%}). Consider increasing k or improving data quality."
+                    })
+                
+                if self.actual_k_used < self.n_components * 0.5:
+                    report["recommendations"].append({
+                        "type": "info",
+                        "message": f"Using much fewer components than requested ({self.actual_k_used}/{self.n_components}). Dataset might be limited."
+                    })
+                
+                if self.actual_k_used > 30 and self.explained_variance > 0.95:
+                    report["recommendations"].append({
+                        "type": "optimization",
+                        "message": f"High k with excellent variance. Consider running k optimization to find minimum effective k."
+                    })
+            
+            return report
+            
+        except Exception as e:
+            logger.error(f"Error generating k factor report: {e}")
+            return {"error": str(e)}
 
 # Istanza globale del servizio
 ml_service = MLRecommendationService()

@@ -14,6 +14,7 @@ import RecommendationsPage from './pages/RecommendationsPage';
 
 // Import components
 import Navbar from './components/Navbar';
+import MLMonitor from './components/MLMonitor';
 import { getAuthToken } from './services/api';
 
 function App() {
@@ -125,6 +126,16 @@ function App() {
               element={
                 user ? (
                   <RecommendationsPage user={user} />
+                ) : (
+                  <Navigate to="/login" replace />
+                )
+              } 
+            />
+            <Route 
+              path="/ml-monitor" 
+              element={
+                user ? (
+                  <MLMonitor />
                 ) : (
                   <Navigate to="/login" replace />
                 )
