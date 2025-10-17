@@ -156,5 +156,3 @@ JWT_SECRET_KEY=your_secret_key
 - React Router
 - Axios
 - React Icons
-
-Buon sviluppo! 🚀
