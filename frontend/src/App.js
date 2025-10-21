@@ -15,7 +15,6 @@ import RecommendationsPage from './pages/RecommendationsPage';
 // Import components
 import Navbar from './components/Navbar';
 import MLMonitor from './components/MLMonitor';
-import TMDBConfig from './components/TMDBConfig';
 import KOptimizationMonitor from './components/KOptimizationMonitor';
 import { getAuthToken } from './services/api';
 
@@ -138,16 +137,6 @@ function App() {
               element={
                 user ? (
                   <MLMonitor />
-                ) : (
-                  <Navigate to="/login" replace />
-                )
-              } 
-            />
-            <Route 
-              path="/tmdb-config" 
-              element={
-                user ? (
-                  <TMDBConfig />
                 ) : (
                   <Navigate to="/login" replace />
                 )
