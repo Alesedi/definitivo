@@ -9,6 +9,9 @@ from scipy.sparse import csr_matrix
 from typing import List, Dict, Any, Optional
 import os
 import requests
+import pickle
+import json
+from datetime import datetime, timedelta
 from modelli_ODM.voto_odm import Votazione
 from modelli_ODM.film_odm import Film
 from modelli_ODM.utente_odm import Utente
@@ -32,22 +35,18 @@ class MLRecommendationService:
         self.user_profile = None
         self.genre_preferences = None
         
-        # Configurazionipy as np
-from sklearn.preprocessing import LabelEncoder
-from sklearn.decomposition import TruncatedSVD
-from sklearn.metrics import mean_squared_error, mean_absolute_error
-from sklearn.model_selection import train_test_split
-from sklearn.cluster import KMeans
-from scipy.sparse import csr_matrix
-from typing import List, Dict, Any, Optional
-import os
-import requests
-from modelli_ODM.utente_odm import Utente
-from modelli_ODM.film_odm import Film
-from modelli_ODM.voto_odm import Votazione
-import logging
-
-logger = logging.getLogger(__name__)
+        # TMDB Integration
+        self.tmdb_api_key = os.getenv('TMDB_API_KEY', '8265bd1679663a7ea12ac168da84d2e8')  # Tua API key
+        self.tmdb_base_url = "https://api.themoviedb.org/3"
+        self.tmdb_cache_dir = "data/tmdb_cache"
+        self.use_tmdb_training = True  # Flag per abilitare training TMDB
+        self.tmdb_movies_df = None
+        self.tmdb_ratings_df = None
+        
+        # Training source tracking
+        self.training_source = "hybrid"  # "aflix_only", "tmdb_only", "hybrid"
+        
+        # Configurazioni
 
 class MLRecommendationService:
     def __init__(self):
@@ -64,6 +63,12 @@ class MLRecommendationService:
         # Parametri modello
         self.n_components = 50
         self.n_clusters = 3
+        
+        # Ottimizzazione automatica K
+        self.auto_optimize_k_svd = True
+        self.auto_optimize_k_cluster = True
+        self.k_svd_range = range(10, 101, 10)
+        self.k_cluster_range = range(2, 16)
         
         # Tracciamento fattore k (numero componenti SVD)
         self.actual_k_used = 0  # Numero effettivo di componenti utilizzati
@@ -121,23 +126,69 @@ class MLRecommendationService:
             raise
 
     def train_model(self) -> Dict[str, Any]:
-        """Addestra il modello SVD e clustering"""
+        """Addestra il modello SVD e clustering con supporto TMDB"""
         try:
-            # Prepara i dati
-            df = self.prepare_data()
+            logger.info("🚀 INIZIO TRAINING MODELLO ML")
+            logger.info("=" * 80)
             
-            # Encoding utenti e film
-            self.user_encoder = LabelEncoder()
-            self.movie_encoder = LabelEncoder()
-            
-            df['user_idx'] = self.user_encoder.fit_transform(df['userId'])
-            df['movie_idx'] = self.movie_encoder.fit_transform(df['title'])
-            
-            # Crea matrice sparsa
-            ratings_sparse = csr_matrix(
-                (df['rating'], (df['user_idx'], df['movie_idx'])),
-                shape=(df['user_idx'].nunique(), df['movie_idx'].nunique())
-            )
+            # Decide fonte dati per training
+            if self.use_tmdb_training and self.tmdb_api_key:
+                logger.info("🎬 Modalità HYBRID: Training su TMDB + Testing su AFlix")
+                return self._train_hybrid_model()
+            else:
+                logger.info("🏠 Modalità AFlix-only: Training su dati AFlix")
+                return self._train_aflix_only_model()
+                
+        except Exception as e:
+            logger.error(f"❌ Errore training modello: {e}")
+            raise
+    
+    def _train_hybrid_model(self) -> Dict[str, Any]:
+        """Training ibrido: TMDB per training, AFlix per testing"""
+        
+        # 1. Genera o carica dataset TMDB
+        tmdb_data = self._get_or_generate_tmdb_data()
+        
+        # 2. Training SVD su dati TMDB
+        logger.info("🧠 Training SVD su dataset TMDB...")
+        ratings_matrix = self._create_ratings_matrix(tmdb_data)
+        
+        # 3. Applica SVD
+        self._apply_svd_to_matrix(ratings_matrix)
+        
+        # 4. Test su dati AFlix se disponibili
+        aflix_performance = self._test_on_aflix_data()
+        
+        # 5. Statistiche finali
+        stats = self._compile_hybrid_stats(tmdb_data, aflix_performance)
+        
+        self.is_trained = True
+        self.training_source = "hybrid"
+        
+        return stats
+    
+    def _train_aflix_only_model(self) -> Dict[str, Any]:
+        """Training tradizionale solo su dati AFlix"""
+        
+        # Prepara i dati AFlix
+        df = self.prepare_data()
+        
+        if len(df) < 10:
+            logger.warning("⚠️ Dataset AFlix troppo piccolo, uso dati demo TMDB...")
+            return self._train_demo_tmdb_model()
+        
+        # Encoding utenti e film
+        self.user_encoder = LabelEncoder()
+        self.movie_encoder = LabelEncoder()
+        
+        df['user_idx'] = self.user_encoder.fit_transform(df['userId'])
+        df['movie_idx'] = self.movie_encoder.fit_transform(df['title'])
+        
+        # Crea matrice sparsa
+        ratings_sparse = csr_matrix(
+            (df['rating'], (df['user_idx'], df['movie_idx'])),
+            shape=(df['user_idx'].nunique(), df['movie_idx'].nunique())
+        )
             
             # Calcola n_components sicuro per SVD
             min_dim = min(ratings_sparse.shape)
@@ -281,6 +332,506 @@ class MLRecommendationService:
             logger.error(f"Error training model: {e}")
             self.is_trained = False
             raise
+
+    return self._get_popular_recommendations(top_n)
+    
+    # ================================
+    # 🎬 METODI SUPPORTO TMDB
+    # ================================
+    
+    def _get_or_generate_tmdb_data(self) -> pd.DataFrame:
+        """Ottiene o genera dataset TMDB per training"""
+        
+        cache_file = os.path.join(self.cache_dir, 'tmdb_training_data.pkl')
+        
+        # Usa cache se disponibile e recente (7 giorni)
+        if os.path.exists(cache_file):
+            mod_time = os.path.getmtime(cache_file)
+            if (datetime.now().timestamp() - mod_time) < 7 * 24 * 3600:
+                logger.info("📂 Caricamento dataset TMDB da cache...")
+                with open(cache_file, 'rb') as f:
+                    return pickle.load(f)
+        
+        logger.info("🔄 Generazione nuovo dataset TMDB...")
+        
+        # Fetch film popolari da TMDB
+        popular_movies = self._fetch_tmdb_popular_movies(pages=20)  # ~400 film
+        
+        # Genera rating sintetici
+        tmdb_ratings = self._generate_synthetic_ratings(popular_movies, n_users=10000)
+        
+        # Salva in cache
+        os.makedirs(self.cache_dir, exist_ok=True)
+        with open(cache_file, 'wb') as f:
+            pickle.dump(tmdb_ratings, f)
+        
+        logger.info(f"✅ Dataset TMDB generato: {len(tmdb_ratings)} rating")
+        return tmdb_ratings
+    
+    def _fetch_tmdb_popular_movies(self, pages: int = 10) -> List[Dict]:
+        """Recupera film popolari da TMDB API"""
+        import requests
+        
+        movies = []
+        
+        for page in range(1, pages + 1):
+            try:
+                url = f"{self.tmdb_base_url}/movie/popular"
+                params = {
+                    'api_key': self.tmdb_api_key,
+                    'page': page,
+                    'language': 'it-IT'
+                }
+                
+                response = requests.get(url, params=params, timeout=10)
+                response.raise_for_status()
+                
+                data = response.json()
+                movies.extend(data.get('results', []))
+                
+                # Rate limiting
+                import time
+                time.sleep(0.1)
+                
+            except Exception as e:
+                logger.warning(f"Errore fetch pagina {page}: {e}")
+                break
+        
+        logger.info(f"📥 Recuperati {len(movies)} film da TMDB")
+        return movies
+    
+    def _generate_synthetic_ratings(self, movies: List[Dict], n_users: int = 10000) -> pd.DataFrame:
+        """Genera rating sintetici basati su caratteristiche TMDB"""
+        
+        ratings_data = []
+        
+        # Simula diversi tipi di utenti con preferenze
+        user_profiles = self._create_user_profiles(n_users)
+        
+        for user_id in range(n_users):
+            profile = user_profiles[user_id]
+            
+            # Ogni utente valuta 10-50 film casualmente
+            n_ratings = np.random.randint(10, 51)
+            user_movies = np.random.choice(len(movies), size=min(n_ratings, len(movies)), replace=False)
+            
+            for movie_idx in user_movies:
+                movie = movies[movie_idx]
+                
+                # Genera rating basato su profilo utente e caratteristiche film
+                rating = self._calculate_synthetic_rating(profile, movie)
+                
+                ratings_data.append({
+                    'userId': f"tmdb_user_{user_id}",
+                    'movieId': movie['id'],
+                    'title': movie['title'],
+                    'rating': rating,
+                    'timestamp': datetime.now().timestamp(),
+                    'genres': movie.get('genre_ids', []),
+                    'tmdb_rating': movie.get('vote_average', 5.0),
+                    'popularity': movie.get('popularity', 0)
+                })
+        
+        df = pd.DataFrame(ratings_data)
+        logger.info(f"🎯 Generati {len(df)} rating sintetici per {n_users} utenti")
+        return df
+    
+    def _create_user_profiles(self, n_users: int) -> List[Dict]:
+        """Crea profili utente diversificati"""
+        profiles = []
+        
+        # Generi TMDB comuni
+        genres = [28, 12, 16, 35, 80, 99, 18, 10751, 14, 36, 27, 10402, 9648, 10749, 878, 10770, 53, 10752, 37]
+        
+        for _ in range(n_users):
+            # Preferenze casuali ma realistiche
+            favorite_genres = np.random.choice(genres, size=np.random.randint(2, 6), replace=False)
+            rating_tendency = np.random.normal(3.5, 0.8)  # Tendenza rating
+            rating_variance = np.random.uniform(0.5, 1.5)  # Variabilità rating
+            
+            profiles.append({
+                'favorite_genres': favorite_genres.tolist(),
+                'rating_tendency': max(1.0, min(5.0, rating_tendency)),
+                'rating_variance': rating_variance,
+                'popularity_bias': np.random.uniform(-0.5, 1.0)  # Bias verso film popolari
+            })
+        
+        return profiles
+    
+    def _calculate_synthetic_rating(self, profile: Dict, movie: Dict) -> float:
+        """Calcola rating sintetico basato su profilo e caratteristiche film"""
+        
+        base_rating = profile['rating_tendency']
+        
+        # Bonus per generi preferiti
+        movie_genres = movie.get('genre_ids', [])
+        genre_match = len(set(profile['favorite_genres']).intersection(movie_genres))
+        genre_bonus = genre_match * 0.3
+        
+        # Effetto popolarità
+        popularity = movie.get('popularity', 0)
+        popularity_effect = profile['popularity_bias'] * min(popularity / 100, 1.0)
+        
+        # Effetto qualità TMDB
+        tmdb_rating = movie.get('vote_average', 5.0)
+        quality_effect = (tmdb_rating - 5.0) * 0.2
+        
+        # Calcola rating finale con variabilità
+        final_rating = base_rating + genre_bonus + popularity_effect + quality_effect
+        final_rating += np.random.normal(0, profile['rating_variance'])
+        
+        # Clamp tra 0.5 e 5.0
+        return max(0.5, min(5.0, round(final_rating * 2) / 2))  # Arrotonda a 0.5
+    
+    def _apply_svd_to_matrix(self, ratings_matrix):
+        """Applica SVD alla matrice ratings"""
+        
+        min_dim = min(ratings_matrix.shape)
+        self.current_k_factor = min(self.current_k_factor, min_dim - 1)
+        
+        logger.info(f"🧮 Applicando SVD con k_factor: {self.current_k_factor}")
+        
+        U, sigma, Vt = svds(ratings_matrix, k=self.current_k_factor)
+        self.user_factors = U
+        self.item_factors = Vt.T
+        
+        # Conversione per compatibilità numpy
+        self.user_factors = np.ascontiguousarray(self.user_factors)
+        self.item_factors = np.ascontiguousarray(self.item_factors)
+        
+        logger.info(f"✅ SVD completato: {U.shape} x {Vt.T.shape}")
+    
+    def _create_ratings_matrix(self, df: pd.DataFrame):
+        """Crea matrice ratings da DataFrame"""
+        
+        # Encoding
+        self.user_encoder = LabelEncoder()
+        self.movie_encoder = LabelEncoder()
+        
+        df['user_idx'] = self.user_encoder.fit_transform(df['userId'])
+        df['movie_idx'] = self.movie_encoder.fit_transform(df['title'])
+        
+        # Matrice sparsa
+        return csr_matrix(
+            (df['rating'], (df['user_idx'], df['movie_idx'])),
+            shape=(df['user_idx'].nunique(), df['movie_idx'].nunique())
+        )
+    
+    def _test_on_aflix_data(self) -> Dict:
+        """Testa modello TMDB su dati AFlix reali"""
+        
+        try:
+            # Carica dati AFlix
+            aflix_df = self.prepare_data()
+            
+            if len(aflix_df) < 5:
+                return {"status": "insufficient_aflix_data", "rmse": None}
+            
+            # Mappa film AFlix a TMDB (semplificato)
+            # In produzione, useresti fuzzy matching o mapping ID
+            common_movies = []
+            for title in aflix_df['title'].unique():
+                if title in self.movie_encoder.classes_:
+                    common_movies.append(title)
+            
+            if len(common_movies) < 3:
+                return {"status": "no_common_movies", "rmse": None}
+            
+            # Test su film in comune
+            test_data = aflix_df[aflix_df['title'].isin(common_movies)]
+            
+            # Predizioni
+            predictions = []
+            actuals = []
+            
+            for _, row in test_data.iterrows():
+                try:
+                    movie_idx = self.movie_encoder.transform([row['title']])[0]
+                    # Usa utente generico (media)
+                    pred_rating = np.mean(self.item_factors[movie_idx])
+                    predictions.append(pred_rating)
+                    actuals.append(row['rating'])
+                except:
+                    continue
+            
+            if len(predictions) > 0:
+                rmse = np.sqrt(mean_squared_error(actuals, predictions))
+                return {
+                    "status": "success",
+                    "rmse": float(rmse),
+                    "test_samples": len(predictions),
+                    "common_movies": len(common_movies)
+                }
+            
+            return {"status": "no_predictions", "rmse": None}
+            
+        except Exception as e:
+            logger.error(f"Errore test AFlix: {e}")
+            return {"status": "error", "rmse": None, "error": str(e)}
+    
+    def _compile_hybrid_stats(self, tmdb_data: pd.DataFrame, aflix_test: Dict) -> Dict:
+        """Compila statistiche training ibrido"""
+        
+        return {
+            'status': 'success',
+            'timestamp': datetime.now().isoformat(),
+            'training_mode': 'hybrid',
+            'model_info': {
+                'algorithm': 'SVD',
+                'k_factor': self.current_k_factor,
+                'training_source': 'tmdb',
+                'test_source': 'aflix'
+            },
+            'tmdb_data': {
+                'total_ratings': len(tmdb_data),
+                'unique_users': tmdb_data['userId'].nunique(),
+                'unique_movies': tmdb_data['title'].nunique(),
+                'rating_distribution': tmdb_data['rating'].value_counts().to_dict()
+            },
+            'aflix_test': aflix_test,
+            'performance': {
+                'test_rmse': aflix_test.get('rmse'),
+                'test_status': aflix_test.get('status')
+            }
+        }
+    
+    def _train_demo_tmdb_model(self) -> Dict:
+        """Training demo con dati TMDB per dataset piccoli"""
+        
+        logger.info("🎬 Modalità DEMO: Usando dataset TMDB ridotto...")
+        
+        # Dataset demo piccolo
+        demo_data = self._get_or_generate_tmdb_data()
+        
+        # Riduci a 1000 rating per demo
+        if len(demo_data) > 1000:
+            demo_data = demo_data.sample(1000, random_state=42)
+        
+        # Training normale
+        ratings_matrix = self._create_ratings_matrix(demo_data)
+        self._apply_svd_to_matrix(ratings_matrix)
+        
+        stats = {
+            'status': 'success',
+            'timestamp': datetime.now().isoformat(),
+            'training_mode': 'demo_tmdb',
+            'model_info': {
+                'algorithm': 'SVD',
+                'k_factor': self.current_k_factor,
+                'total_ratings': len(demo_data),
+                'unique_users': demo_data['userId'].nunique(),
+                'unique_movies': demo_data['title'].nunique()
+            }
+        }
+        
+        return stats
+    
+    # ================================
+    # 🎯 OTTIMIZZAZIONE AUTOMATICA K
+    # ================================
+    
+    def optimize_both_k_values(self, ratings_matrix) -> Dict[str, int]:
+        """Ottimizza automaticamente sia K-SVD che K-Cluster"""
+        
+        logger.info("🎯 OTTIMIZZAZIONE AUTOMATICA K-VALUES")
+        logger.info("=" * 60)
+        
+        results = {}
+        
+        # 1. Ottimizza K-SVD se abilitato
+        if self.auto_optimize_k_svd:
+            optimal_k_svd = self._optimize_k_svd(ratings_matrix)
+            if optimal_k_svd:
+                self.n_components = optimal_k_svd
+                self.current_k_factor = optimal_k_svd
+                results['optimal_k_svd'] = optimal_k_svd
+                logger.info(f"✅ K-SVD ottimizzato: {optimal_k_svd}")
+        
+        # 2. Ottimizza K-Cluster se abilitato  
+        if self.auto_optimize_k_cluster:
+            optimal_k_cluster = self._optimize_k_cluster(ratings_matrix)
+            if optimal_k_cluster:
+                self.n_clusters = optimal_k_cluster
+                results['optimal_k_cluster'] = optimal_k_cluster
+                logger.info(f"✅ K-Cluster ottimizzato: {optimal_k_cluster}")
+        
+        return results
+    
+    def _optimize_k_svd(self, ratings_matrix) -> Optional[int]:
+        """Ottimizza K per SVD"""
+        
+        logger.info("🔍 Ottimizzazione K-SVD...")
+        
+        best_k = None
+        best_score = -1
+        results = []
+        
+        for k in self.k_svd_range:
+            try:
+                # Limite sicurezza
+                max_k = min(ratings_matrix.shape) - 1
+                if k >= max_k:
+                    continue
+                
+                # Test SVD con k componenti
+                U, sigma, Vt = svds(ratings_matrix, k=k)
+                
+                # Calcola varianza spiegata approssimata
+                total_variance = np.sum(sigma ** 2)
+                explained_variance = total_variance / (ratings_matrix.nnz if hasattr(ratings_matrix, 'nnz') else ratings_matrix.size)
+                
+                # Calcola efficienza (varianza per componente)
+                efficiency = explained_variance / k
+                
+                # Score composito (personalizzabile)
+                composite_score = explained_variance * 0.7 + efficiency * 0.3
+                
+                results.append({
+                    'k': k,
+                    'explained_variance': explained_variance,
+                    'efficiency': efficiency,
+                    'composite_score': composite_score
+                })
+                
+                if composite_score > best_score:
+                    best_score = composite_score
+                    best_k = k
+                
+                logger.info(f"K={k:2d} | Varianza: {explained_variance:.4f} | Efficienza: {efficiency:.4f} | Score: {composite_score:.4f}")
+                
+            except Exception as e:
+                logger.warning(f"Errore K-SVD={k}: {e}")
+                continue
+        
+        # Salva risultati per monitoring
+        self.k_performance_log['svd_optimization'] = results
+        
+        return best_k
+    
+    def _optimize_k_cluster(self, ratings_matrix) -> Optional[int]:
+        """Ottimizza K per Clustering"""
+        
+        logger.info("🎯 Ottimizzazione K-Cluster...")
+        
+        # Usa SVD per ridurre dimensionalità per clustering
+        try:
+            k_for_clustering = min(20, min(ratings_matrix.shape) - 1)
+            U, sigma, Vt = svds(ratings_matrix, k=k_for_clustering)
+            
+            # Usa prime 2 componenti se possibile
+            if U.shape[1] >= 2:
+                cluster_data = U[:, :2]
+            else:
+                # Aggiungi rumore per clustering 1D
+                cluster_data = np.column_stack([U[:, 0], np.random.normal(0, 0.1, U.shape[0])])
+            
+        except Exception as e:
+            logger.warning(f"Errore preparazione dati clustering: {e}")
+            return None
+        
+        best_k = None
+        best_score = -1
+        results = []
+        
+        for k in self.k_cluster_range:
+            if k >= len(cluster_data):
+                continue
+                
+            try:
+                # Test clustering
+                kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
+                labels = kmeans.fit_predict(cluster_data)
+                
+                # Calcola silhouette score
+                from sklearn.metrics import silhouette_score
+                silhouette = silhouette_score(cluster_data, labels)
+                
+                # Calcola bilanciamento cluster
+                unique, counts = np.unique(labels, return_counts=True)
+                balance = 1.0 - np.std(counts) / np.mean(counts) if len(counts) > 1 else 0
+                
+                # Interpretabilità (preferisci meno cluster)
+                interpretability = 1.0 / k
+                
+                # Score composito
+                composite_score = silhouette * 0.6 + balance * 0.3 + interpretability * 0.1
+                
+                results.append({
+                    'k': k,
+                    'silhouette_score': silhouette,
+                    'balance': balance,
+                    'interpretability': interpretability,
+                    'composite_score': composite_score
+                })
+                
+                if composite_score > best_score:
+                    best_score = composite_score
+                    best_k = k
+                
+                logger.info(f"K={k:2d} | Silhouette: {silhouette:.3f} | Balance: {balance:.3f} | Score: {composite_score:.4f}")
+                
+            except Exception as e:
+                logger.warning(f"Errore K-Cluster={k}: {e}")
+                continue
+        
+        # Salva risultati
+        self.k_performance_log['cluster_optimization'] = results
+        
+        return best_k
+
+    def _create_user_clusters(self, df: pd.DataFrame):
+        """Crea cluster utenti"""
+        
+        n_clusters = min(5, len(df) // 3)
+        
+        if n_clusters >= 2:
+            kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+            user_clusters = kmeans.fit_predict(self.user_factors)
+            
+            self.user_clusters = {}
+            for idx, cluster in enumerate(user_clusters):
+                user_id = self.user_encoder.inverse_transform([idx])[0]
+                self.user_clusters[user_id] = int(cluster)
+            
+            logger.info(f"🎯 Creati {n_clusters} cluster con {len(self.user_clusters)} utenti")
+    
+    def _calculate_aflix_stats(self, df: pd.DataFrame, ratings_sparse) -> Dict:
+        """Calcola statistiche per training AFlix"""
+        
+        # RMSE on training data
+        predicted_matrix = np.dot(self.user_factors, self.item_factors.T)
+        mse = mean_squared_error(ratings_sparse.data, 
+                               predicted_matrix[ratings_sparse.row, ratings_sparse.col])
+        rmse = np.sqrt(mse)
+        
+        # Coverage
+        unique_users = len(df['userId'].unique())
+        unique_movies = len(df['title'].unique())
+        total_interactions = len(df)
+        
+        return {
+            'status': 'success',
+            'timestamp': datetime.now().isoformat(),
+            'training_mode': 'aflix_only',
+            'model_info': {
+                'algorithm': 'SVD',
+                'k_factor': self.current_k_factor,
+                'users': unique_users,
+                'movies': unique_movies,
+                'ratings': total_interactions,
+                'density': f"{(total_interactions/(unique_users*unique_movies)*100):.2f}%"
+            },
+            'metrics': {
+                'rmse': round(rmse, 4),
+                'coverage': f"{(unique_movies/unique_movies*100):.1f}%",
+                'clusters': len(self.user_clusters) if hasattr(self, 'user_clusters') else 0
+            },
+            'training_data': {
+                'source': 'aflix_db',
+                'total_ratings': total_interactions,
+                'rating_distribution': df['rating'].value_counts().to_dict()
+            }
+        }
 
     def get_user_recommendations(self, user_id: str, top_n: int = 10) -> List[Dict[str, Any]]:
         """Genera raccomandazioni personalizzate per un utente"""

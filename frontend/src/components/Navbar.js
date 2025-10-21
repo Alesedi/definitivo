@@ -2,7 +2,7 @@ import React from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import styled from 'styled-components';
 import { Button, Flex, Container } from '../styles/components';
-import { FaFilm, FaStar, FaUser, FaSignOutAlt, FaBrain, FaChartLine } from 'react-icons/fa';
+import { FaFilm, FaStar, FaUser, FaSignOutAlt, FaBrain, FaChartLine, FaDatabase, FaCogs } from 'react-icons/fa';
 
 const NavbarContainer = styled.nav`
   background: linear-gradient(135deg, ${props => props.theme.colors.primary} 0%, ${props => props.theme.colors.primaryLight} 100%);
@@ -113,6 +113,14 @@ const Navbar = ({ user, onLogout }) => {
           <NavLink to="/ml-monitor">
             <FaChartLine />
             Monitor ML
+          </NavLink>
+          <NavLink to="/tmdb-config">
+            <FaDatabase />
+            TMDB Config
+          </NavLink>
+          <NavLink to="/k-optimization">
+            <FaCogs />
+            K-Optimizer
           </NavLink>
         </NavLinks>
         
