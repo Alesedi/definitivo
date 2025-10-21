@@ -157,160 +157,160 @@ class MLRecommendationService:
             df = self.prepare_data()
             
             if len(df) < 10:
-                logger.warning("⚠️ Dataset AFlix tropico piccolo, uso dati demo TMDB...")
+                logger.warning("⚠️ Dataset AFlix troppo piccolo, uso dati demo TMDB...")
                 return self._train_demo_tmdb_model()
-        
-        # Encoding utenti e film
-        self.user_encoder = LabelEncoder()
-        self.movie_encoder = LabelEncoder()
-        
-        df['user_idx'] = self.user_encoder.fit_transform(df['userId'])
-        df['movie_idx'] = self.movie_encoder.fit_transform(df['title'])
-        
-        # Crea matrice sparsa
-        ratings_sparse = csr_matrix(
-            (df['rating'], (df['user_idx'], df['movie_idx'])),
-            shape=(df['user_idx'].nunique(), df['movie_idx'].nunique())
-        )
-        
-        # Calcola n_components sicuro per SVD
-        min_dim = min(ratings_sparse.shape)
-        max_components = max(1, min_dim - 1)  # Assicura almeno 1
-        safe_components = min(self.n_components, max_components)
-        
-        # 🔍 LOGGING DETTAGLIATO SCELTA FATTORE K
-        logger.info("=" * 60)
-        logger.info("🎯 PROCESSO SELEZIONE FATTORE K - SVD")
-        logger.info("=" * 60)
-        logger.info(f"📊 Matrice dati: {ratings_sparse.shape[0]} utenti × {ratings_sparse.shape[1]} film")
-        logger.info(f"📈 Densità matrice: {(len(df) / (ratings_sparse.shape[0] * ratings_sparse.shape[1]) * 100):.2f}%")
-        logger.info(f"🎛️  K richiesto dal modello: {self.n_components}")
-        logger.info(f"📏 Dimensione minima matrice: {min_dim}")
-        logger.info(f"🔝 Massimo K possibile: {max_components}")
-        logger.info(f"✅ K finale selezionato: {safe_components}")
-        
-        if safe_components < self.n_components:
-            logger.warning(f"⚠️  K ridotto da {self.n_components} a {safe_components} per limitazioni dati")
-        else:
-            logger.info(f"✅ K utilizzato come richiesto: {safe_components}")
-        
-        logger.info("🚀 Avvio decomposizione SVD...")
-        logger.info("-" * 60)
             
-        # Verifica diversità dati per Collaborative Filtering
-        n_users = df['userId'].nunique()
-        n_movies = df['movieId'].nunique()
-        
-        if n_users < 2:
-            # Fallback a Content-Based se c'è solo 1 utente
-            return self._train_content_based_model(df)
-        
-        # Verifica dimensioni minime per SVD
-        if min_dim < 2:
-            raise ValueError(f"Insufficient data diversity for SVD: matrix shape {ratings_sparse.shape}. Need at least 2 users and 2 movies.")
-        
-        if safe_components <= 0:
-            safe_components = 1  # Fallback a 1 componente
-        
-        # Training SVD
-        logger.info("🔄 Esecuzione TruncatedSVD...")
-        self.svd_model = TruncatedSVD(n_components=safe_components, random_state=42)
-        logger.info("📊 Calcolo fattori latenti utenti...")
-        self.user_factors = self.svd_model.fit_transform(ratings_sparse)
-        logger.info("🎬 Calcolo fattori latenti film...")
-        self.movie_factors = self.svd_model.components_.T
-        self.explained_variance = self.svd_model.explained_variance_ratio_.sum()
+            # Encoding utenti e film
+            self.user_encoder = LabelEncoder()
+            self.movie_encoder = LabelEncoder()
             
-        logger.info("✅ SVD completata!")
-        logger.info(f"📈 Varianza totale spiegata: {self.explained_variance:.1%}")
-        logger.info(f"👥 Fattori utenti: {self.user_factors.shape}")
-        logger.info(f"🎭 Fattori film: {self.movie_factors.shape}")
-        
-        # Tracciamento dettagliato del fattore k
-        self.actual_k_used = safe_components
-        self.variance_per_component = self.svd_model.explained_variance_ratio_.tolist()
-        
-        # 📊 ANALISI COMPONENTI DETTAGLIATA
-        logger.info("=" * 60)
-        logger.info("📊 ANALISI DETTAGLIATA COMPONENTI SVD")
-        logger.info("=" * 60)
-        cumulative_var = 0
-        for i, var_ratio in enumerate(self.variance_per_component[:10]):  # Prime 10
-            cumulative_var += var_ratio
-            logger.info(f"Componente {i+1:2d}: {var_ratio:.4f} ({var_ratio*100:.2f}%) | Cumulativa: {cumulative_var:.4f} ({cumulative_var*100:.1f}%)")
-        
-        if len(self.variance_per_component) > 10:
-            logger.info(f"... e altre {len(self.variance_per_component) - 10} componenti")
-        
-        # Identifica elbow point in tempo reale
-        if len(self.variance_per_component) > 2:
-            differences = []
-            for i in range(1, len(self.variance_per_component)):
-                diff = self.variance_per_component[i-1] - self.variance_per_component[i]
-                differences.append(diff)
+            df['user_idx'] = self.user_encoder.fit_transform(df['userId'])
+            df['movie_idx'] = self.movie_encoder.fit_transform(df['title'])
             
-            if differences:
-                max_diff = max(differences)
-                elbow_point = None
-                for i, diff in enumerate(differences):
-                    if diff < max_diff * 0.1:
-                        elbow_point = i + 1
-                        break
+            # Crea matrice sparsa
+            ratings_sparse = csr_matrix(
+                (df['rating'], (df['user_idx'], df['movie_idx'])),
+                shape=(df['user_idx'].nunique(), df['movie_idx'].nunique())
+            )
+            
+            # Calcola n_components sicuro per SVD
+            min_dim = min(ratings_sparse.shape)
+            max_components = max(1, min_dim - 1)  # Assicura almeno 1
+            safe_components = min(self.n_components, max_components)
+            
+            # 🔍 LOGGING DETTAGLIATO SCELTA FATTORE K
+            logger.info("=" * 60)
+            logger.info("🎯 PROCESSO SELEZIONE FATTORE K - SVD")
+            logger.info("=" * 60)
+            logger.info(f"📊 Matrice dati: {ratings_sparse.shape[0]} utenti × {ratings_sparse.shape[1]} film")
+            logger.info(f"📈 Densità matrice: {(len(df) / (ratings_sparse.shape[0] * ratings_sparse.shape[1]) * 100):.2f}%")
+            logger.info(f"🎛️  K richiesto dal modello: {self.n_components}")
+            logger.info(f"📏 Dimensione minima matrice: {min_dim}")
+            logger.info(f"🔝 Massimo K possibile: {max_components}")
+            logger.info(f"✅ K finale selezionato: {safe_components}")
+            
+            if safe_components < self.n_components:
+                logger.warning(f"⚠️  K ridotto da {self.n_components} a {safe_components} per limitazioni dati")
+            else:
+                logger.info(f"✅ K utilizzato come richiesto: {safe_components}")
+            
+            logger.info("🚀 Avvio decomposizione SVD...")
+            logger.info("-" * 60)
+            
+            # Verifica diversità dati per Collaborative Filtering
+            n_users = df['userId'].nunique()
+            n_movies = df['movieId'].nunique()
+            
+            if n_users < 2:
+                # Fallback a Content-Based se c'è solo 1 utente
+                return self._train_content_based_model(df)
+            
+            # Verifica dimensioni minime per SVD
+            if min_dim < 2:
+                raise ValueError(f"Insufficient data diversity for SVD: matrix shape {ratings_sparse.shape}. Need at least 2 users and 2 movies.")
+            
+            if safe_components <= 0:
+                safe_components = 1  # Fallback a 1 componente
+            
+            # Training SVD
+            logger.info("🔄 Esecuzione TruncatedSVD...")
+            self.svd_model = TruncatedSVD(n_components=safe_components, random_state=42)
+            logger.info("📊 Calcolo fattori latenti utenti...")
+            self.user_factors = self.svd_model.fit_transform(ratings_sparse)
+            logger.info("🎬 Calcolo fattori latenti film...")
+            self.movie_factors = self.svd_model.components_.T
+            self.explained_variance = self.svd_model.explained_variance_ratio_.sum()
+            
+            logger.info("✅ SVD completata!")
+            logger.info(f"📈 Varianza totale spiegata: {self.explained_variance:.1%}")
+            logger.info(f"👥 Fattori utenti: {self.user_factors.shape}")
+            logger.info(f"🎭 Fattori film: {self.movie_factors.shape}")
+            
+            # Tracciamento dettagliato del fattore k
+            self.actual_k_used = safe_components
+            self.variance_per_component = self.svd_model.explained_variance_ratio_.tolist()
+            
+            # 📊 ANALISI COMPONENTI DETTAGLIATA
+            logger.info("=" * 60)
+            logger.info("📊 ANALISI DETTAGLIATA COMPONENTI SVD")
+            logger.info("=" * 60)
+            cumulative_var = 0
+            for i, var_ratio in enumerate(self.variance_per_component[:10]):  # Prime 10
+                cumulative_var += var_ratio
+                logger.info(f"Componente {i+1:2d}: {var_ratio:.4f} ({var_ratio*100:.2f}%) | Cumulativa: {cumulative_var:.4f} ({cumulative_var*100:.1f}%)")
+            
+            if len(self.variance_per_component) > 10:
+                logger.info(f"... e altre {len(self.variance_per_component) - 10} componenti")
+            
+            # Identifica elbow point in tempo reale
+            if len(self.variance_per_component) > 2:
+                differences = []
+                for i in range(1, len(self.variance_per_component)):
+                    diff = self.variance_per_component[i-1] - self.variance_per_component[i]
+                    differences.append(diff)
                 
-                if elbow_point:
-                    logger.info(f"📍 Elbow Point identificato: Componente {elbow_point}")
-                    if elbow_point < safe_components:
-                        logger.info(f"💡 Suggerimento: Potresti usare solo {elbow_point} componenti mantenendo {cumulative_var:.1%} della varianza")
-        
-        logger.info("-" * 60)
-        
-        # Log delle informazioni k
-        k_info = {
-            "requested_k": self.n_components,
-            "actual_k": self.actual_k_used,
-            "max_possible_k": max_components,
-            "total_explained_variance": float(self.explained_variance),
-            "variance_per_component": self.variance_per_component,
-            "matrix_shape": ratings_sparse.shape,
-            "data_sparsity": 1 - (len(df) / (ratings_sparse.shape[0] * ratings_sparse.shape[1]))
-        }
-        
-        logger.info(f"SVD Training - K Factor Details: {k_info}")
-        self.k_history.append(k_info)
-        
-        # Clustering dei film nello spazio latente
-        if self.movie_factors.shape[0] > self.n_clusters and self.movie_factors.shape[1] >= 2:
-            # Usa prime 2 componenti se disponibili
-            X = self.movie_factors[:, :2]
-            self.kmeans_model = KMeans(n_clusters=self.n_clusters, random_state=42)
-            self.cluster_labels = self.kmeans_model.fit_predict(X)
-        elif self.movie_factors.shape[0] > self.n_clusters and self.movie_factors.shape[1] == 1:
-            # Se c'è solo 1 componente, usa quella e aggiungi rumore per clustering
-            X = np.column_stack([self.movie_factors[:, 0], np.random.normal(0, 0.1, self.movie_factors.shape[0])])
-            self.kmeans_model = KMeans(n_clusters=min(self.n_clusters, self.movie_factors.shape[0]), random_state=42)
-            self.cluster_labels = self.kmeans_model.fit_predict(X)
-        else:
-            # Troppi pochi dati per clustering significativo
-            self.kmeans_model = None
-            self.cluster_labels = None
-        
-        self.is_trained = True
-        
-        # Statistiche training
-        stats = {
-            "total_ratings": len(df),
-            "unique_users": df['userId'].nunique(),
-            "unique_movies": df['movieId'].nunique(),
-            "explained_variance": float(self.explained_variance),
-            "n_components": self.svd_model.n_components,
-            "actual_k_used": self.actual_k_used,
-            "k_efficiency": float(self.explained_variance / self.actual_k_used) if self.actual_k_used > 0 else 0,
-            "training_status": "success"
-        }
-        
-        logger.info(f"Model trained successfully. Stats: {stats}")
-        return stats
-        
+                if differences:
+                    max_diff = max(differences)
+                    elbow_point = None
+                    for i, diff in enumerate(differences):
+                        if diff < max_diff * 0.1:
+                            elbow_point = i + 1
+                            break
+                    
+                    if elbow_point:
+                        logger.info(f"📍 Elbow Point identificato: Componente {elbow_point}")
+                        if elbow_point < safe_components:
+                            logger.info(f"💡 Suggerimento: Potresti usare solo {elbow_point} componenti mantenendo {cumulative_var:.1%} della varianza")
+            
+            logger.info("-" * 60)
+            
+            # Log delle informazioni k
+            k_info = {
+                "requested_k": self.n_components,
+                "actual_k": self.actual_k_used,
+                "max_possible_k": max_components,
+                "total_explained_variance": float(self.explained_variance),
+                "variance_per_component": self.variance_per_component,
+                "matrix_shape": ratings_sparse.shape,
+                "data_sparsity": 1 - (len(df) / (ratings_sparse.shape[0] * ratings_sparse.shape[1]))
+            }
+            
+            logger.info(f"SVD Training - K Factor Details: {k_info}")
+            self.k_history.append(k_info)
+            
+            # Clustering dei film nello spazio latente
+            if self.movie_factors.shape[0] > self.n_clusters and self.movie_factors.shape[1] >= 2:
+                # Usa prime 2 componenti se disponibili
+                X = self.movie_factors[:, :2]
+                self.kmeans_model = KMeans(n_clusters=self.n_clusters, random_state=42)
+                self.cluster_labels = self.kmeans_model.fit_predict(X)
+            elif self.movie_factors.shape[0] > self.n_clusters and self.movie_factors.shape[1] == 1:
+                # Se c'è solo 1 componente, usa quella e aggiungi rumore per clustering
+                X = np.column_stack([self.movie_factors[:, 0], np.random.normal(0, 0.1, self.movie_factors.shape[0])])
+                self.kmeans_model = KMeans(n_clusters=min(self.n_clusters, self.movie_factors.shape[0]), random_state=42)
+                self.cluster_labels = self.kmeans_model.fit_predict(X)
+            else:
+                # Troppi pochi dati per clustering significativo
+                self.kmeans_model = None
+                self.cluster_labels = None
+            
+            self.is_trained = True
+            
+            # Statistiche training
+            stats = {
+                "total_ratings": len(df),
+                "unique_users": df['userId'].nunique(),
+                "unique_movies": df['movieId'].nunique(),
+                "explained_variance": float(self.explained_variance),
+                "n_components": self.svd_model.n_components,
+                "actual_k_used": self.actual_k_used,
+                "k_efficiency": float(self.explained_variance / self.actual_k_used) if self.actual_k_used > 0 else 0,
+                "training_status": "success"
+            }
+            
+            logger.info(f"Model trained successfully. Stats: {stats}")
+            return stats
+            
         except Exception as e:
             logger.error(f"Error training model: {e}")
             self.is_trained = False
