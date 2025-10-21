@@ -223,7 +223,7 @@ const RecommendationsPage = ({ user }) => {
 
   const fetchModelStatus = async () => {
     try {
-      const response = await api.get('/recommendations/status');
+      const response = await api.get('/api/recommendations/status');
       setModelStatus(response.data);
     } catch (error) {
       console.error('Error fetching model status:', error);
@@ -235,7 +235,7 @@ const RecommendationsPage = ({ user }) => {
     setLoading(true);
     setError('');
     try {
-      await api.get('/recommendations/train-sync');
+      await api.get('/api/recommendations/train-sync');
       setError('');
       fetchModelStatus();
       alert('Modello addestrato con successo!');
@@ -251,7 +251,7 @@ const RecommendationsPage = ({ user }) => {
     setLoading(true);
     setError('');
     try {
-      const response = await api.get(`/recommendations/user/${user.id}?top_n=10`);
+      const response = await api.get(`/api/recommendations/user/${user.id}?top_n=10`);
       setRecommendations(response.data);
       setError('');
     } catch (error) {
@@ -266,7 +266,7 @@ const RecommendationsPage = ({ user }) => {
     setLoading(true);
     setError('');
     try {
-      const response = await api.get(`/recommendations/user/${user.id}/history`);
+      const response = await api.get(`/api/recommendations/user/${user.id}/history`);
       setUserHistory(response.data);
       setError('');
     } catch (error) {
@@ -281,7 +281,7 @@ const RecommendationsPage = ({ user }) => {
     setLoading(true);
     setError('');
     try {
-      const response = await api.get('/recommendations/evaluation');
+      const response = await api.get('/api/recommendations/evaluation');
       setEvaluation(response.data);
       setError('');
     } catch (error) {
@@ -296,7 +296,7 @@ const RecommendationsPage = ({ user }) => {
     setLoading(true);
     setError('');
     try {
-      const response = await api.get('/recommendations/clustering');
+      const response = await api.get('/api/recommendations/clustering');
       setClustering(response.data);
       setError('');
     } catch (error) {

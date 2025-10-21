@@ -119,11 +119,16 @@ const ClusteringChart = ({ data }) => {
     clusters[point.cluster].push(point);
   });
 
-  return (
-    <ChartContainer>
-      <ChartTitle>📊 Clustering Film - Spazio SVD</ChartTitle>
-      
-      <SVGChart viewBox={`0 0 ${chartWidth} ${chartHeight}`}>
+    return (
+      <ChartContainer>
+        <ChartTitle>
+          📊 Clustering Film AFlix - Spazio SVD
+          {data.total_aflix_movies && (
+            <div style={{fontSize: '12px', color: '#666', marginTop: '4px'}}>
+              {data.total_aflix_movies} film votati dagli utenti AFlix
+            </div>
+          )}
+        </ChartTitle>      <SVGChart viewBox={`0 0 ${chartWidth} ${chartHeight}`}>
         {/* Griglia di sfondo */}
         <defs>
           <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
@@ -203,13 +208,18 @@ const ClusteringChart = ({ data }) => {
             key={`point-${index}`}
             cx={scaleX(point.x)}
             cy={scaleY(point.y)}
-            r="4"
+            r="5"
             fill={CLUSTER_COLORS[point.cluster % CLUSTER_COLORS.length]}
             stroke="#fff"
-            strokeWidth="1"
-            opacity="0.7"
+            strokeWidth="2"
+            opacity="0.8"
           >
-            <title>Film #{index} - Cluster {point.cluster}</title>
+            <title>
+              {point.movie_title ? 
+                `${point.movie_title} - Cluster ${point.cluster}` : 
+                `Film AFlix #${index} - Cluster ${point.cluster}`
+              }
+            </title>
           </circle>
         ))}
       </SVGChart>

@@ -48,13 +48,13 @@ async def shutdown_event():
 # Anche per chiusura improvvisa
 atexit.register(change_monitor.stop_monitoring)
 
-# Includi tutti i router
-app.include_router(auth.router, prefix="/auth", tags=["auth"])
-app.include_router(generi.router, prefix="/generi", tags=["generi"])
-app.include_router(onboarding.router, prefix="/onboarding", tags=["onboarding"])
-app.include_router(ratings.router, prefix="/ratings", tags=["ratings"])
-app.include_router(recommendations.router, prefix="/recommendations", tags=["recommendations"])
-app.include_router(admin.router, prefix="/admin", tags=["admin"])
+# Includi tutti i router con prefisso /api
+app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
+app.include_router(generi.router, prefix="/api/generi", tags=["generi"])
+app.include_router(onboarding.router, prefix="/api/onboarding", tags=["onboarding"])
+app.include_router(ratings.router, prefix="/api/ratings", tags=["ratings"])
+app.include_router(recommendations.router, prefix="/api/recommendations", tags=["recommendations"])
+app.include_router(admin.router, prefix="/api/admin", tags=["admin"])
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="127.0.0.1", port=8005, reload=True)

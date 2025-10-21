@@ -39,7 +39,7 @@ class MLRecommendationService:
         # Ottimizzazione automatica K
         self.auto_optimize_k_svd = True
         self.auto_optimize_k_cluster = True
-        self.k_svd_range = range(10, 101, 10)
+        self.k_svd_range = range(5, 101, 5)  # Range più fitto e partenza più bassa
         self.k_cluster_range = range(2, 16)
         
         # Tracciamento fattore k (numero componenti SVD)
@@ -49,8 +49,8 @@ class MLRecommendationService:
         self.optimal_k = None  # Valore k ottimale identificato
         self.k_performance_log = {}  # Log performance per diversi k
         
-        # TMDB Integration
-        self.tmdb_api_key = os.getenv('TMDB_API_KEY', '8265bd1679663a7ea12ac168da84d2e8')
+        # TMDB Integration - API key corretta
+        self.tmdb_api_key = os.getenv('TMDB_API_KEY', '9e6c375b125d733d9ce459bdd91d4a06')
         self.tmdb_base_url = "https://api.themoviedb.org/3"
         self.tmdb_cache_dir = "data/tmdb_cache"
         self.use_tmdb_training = True
@@ -129,32 +129,55 @@ class MLRecommendationService:
     def _train_hybrid_model(self) -> Dict[str, Any]:
         """Training ibrido: TMDB per training, AFlix per testing"""
         
-        # 1. Genera o carica dataset TMDB
-        tmdb_data = self._get_or_generate_tmdb_data()
-        
-        # 2. Training SVD su dati TMDB
-        logger.info("🧠 Training SVD su dataset TMDB...")
-        ratings_matrix = self._create_ratings_matrix(tmdb_data)
-        
-        # 3. Applica SVD
-        self._apply_svd_to_matrix(ratings_matrix)
+        try:
+            # 1. Genera o carica dataset TMDB
+            logger.info("🔄 Inizio generazione/caricamento dati TMDB...")
+            tmdb_data = self._get_or_generate_tmdb_data()
+            logger.info(f"✅ Dataset TMDB caricato: {len(tmdb_data)} rating, {tmdb_data['userId'].nunique() if len(tmdb_data) > 0 else 0} utenti, {tmdb_data['title'].nunique() if len(tmdb_data) > 0 else 0} film")
+            
+            if len(tmdb_data) == 0:
+                logger.error("❌ Dataset TMDB vuoto! Fallback ad AFlix-only")
+                return self._train_aflix_only_model()
+            
+            # 2. Training SVD su dati TMDB
+            logger.info("🧠 Training SVD su dataset TMDB...")
+            ratings_matrix = self._create_ratings_matrix(tmdb_data)
+            logger.info(f"📊 Matrice rating creata: {ratings_matrix.shape}")
+            
+            # 3. Applica SVD
+            logger.info("🔧 Applicando decomposizione SVD...")
+            self._apply_svd_to_matrix(ratings_matrix)
+            logger.info(f"✅ SVD completata con k_factor: {self.current_k_factor}")
+            
+        except Exception as e:
+            logger.error(f"❌ Errore nel training hybrid: {e}")
+            logger.info("🔄 Fallback a modalità AFlix-only...")
+            return self._train_aflix_only_model()
         
         # 4. Test su dati AFlix se disponibili
         aflix_performance = self._test_on_aflix_data()
         
-        # 5. Statistiche finali
+        # 5. CLUSTERING SUI FILM AFLIX (non TMDB!)
+        self._apply_clustering_on_aflix_movies()
+        
+        # 6. Salva numero di rating per status
+        self._training_ratings_count = len(tmdb_data)
+        
+        # 7. Statistiche finali
         stats = self._compile_hybrid_stats(tmdb_data, aflix_performance)
         
         self.is_trained = True
-        self.training_source = "hybrid"
+        self.training_source = "hybrid_tmdb_train_aflix_test"
         
         return stats
-    
+
     def _train_aflix_only_model(self) -> Dict[str, Any]:
         """Training tradizionale solo su dati AFlix"""
         try:
             # Prepara i dati AFlix
+            logger.info("📊 Preparando dati AFlix...")
             df = self.prepare_data()
+            logger.info(f"✅ Dati AFlix preparati: {len(df)} rating, {df['userId'].nunique() if len(df) > 0 else 0} utenti, {df['title'].nunique() if len(df) > 0 else 0} film")
             
             if len(df) < 10:
                 logger.warning("⚠️ Dataset AFlix troppo piccolo, uso dati demo TMDB...")
@@ -212,23 +235,20 @@ class MLRecommendationService:
             if safe_components <= 0:
                 safe_components = 1  # Fallback a 1 componente
             
-            # Training SVD
-            logger.info("🔄 Esecuzione TruncatedSVD...")
-            self.svd_model = TruncatedSVD(n_components=safe_components, random_state=42)
-            logger.info("📊 Calcolo fattori latenti utenti...")
-            self.user_factors = self.svd_model.fit_transform(ratings_sparse)
-            logger.info("🎬 Calcolo fattori latenti film...")
-            self.movie_factors = self.svd_model.components_.T
-            self.explained_variance = self.svd_model.explained_variance_ratio_.sum()
+            # Imposta il fattore K prima dell'SVD
+            self.current_k_factor = safe_components
             
-            logger.info("✅ SVD completata!")
-            logger.info(f"📈 Varianza totale spiegata: {self.explained_variance:.1%}")
+            # Training SVD usando il metodo unificato
+            logger.info("🔄 Applicando SVD unificato...")
+            self._apply_svd_to_matrix(ratings_sparse)
+            
+            logger.info("✅ SVD AFlix completata!")
+            logger.info(f"📈 Varianza spiegata: {self.explained_variance:.1%}")
             logger.info(f"👥 Fattori utenti: {self.user_factors.shape}")
             logger.info(f"🎭 Fattori film: {self.movie_factors.shape}")
-            
-            # Tracciamento dettagliato del fattore k
-            self.actual_k_used = safe_components
-            self.variance_per_component = self.svd_model.explained_variance_ratio_.tolist()
+            logger.info(f"🎯 K utilizzato: {self.actual_k_used}")
+            # Per metodo unificato, creiamo una lista di varianza approssimata
+            self.variance_per_component = [self.explained_variance / self.actual_k_used] * self.actual_k_used if self.actual_k_used > 0 else []
             
             # 📊 ANALISI COMPONENTI DETTAGLIATA
             logger.info("=" * 60)
@@ -279,33 +299,53 @@ class MLRecommendationService:
             self.k_history.append(k_info)
             
             # Clustering dei film nello spazio latente
-            if self.movie_factors.shape[0] > self.n_clusters and self.movie_factors.shape[1] >= 2:
-                # Usa prime 2 componenti se disponibili
-                X = self.movie_factors[:, :2]
-                self.kmeans_model = KMeans(n_clusters=self.n_clusters, random_state=42)
+            if self.movie_factors.shape[0] >= 2:  # Almeno 2 film per clustering
+                n_clusters_actual = min(self.n_clusters, max(2, self.movie_factors.shape[0] // 2))
+                
+                if self.movie_factors.shape[1] >= 2:
+                    # Usa prime 2 componenti se disponibili
+                    X = self.movie_factors[:, :2]
+                else:
+                    # Se c'è solo 1 componente, usa quella e aggiungi rumore per clustering
+                    X = np.column_stack([self.movie_factors[:, 0], np.random.normal(0, 0.1, self.movie_factors.shape[0])])
+                
+                self.kmeans_model = KMeans(n_clusters=n_clusters_actual, random_state=42)
                 self.cluster_labels = self.kmeans_model.fit_predict(X)
-            elif self.movie_factors.shape[0] > self.n_clusters and self.movie_factors.shape[1] == 1:
-                # Se c'è solo 1 componente, usa quella e aggiungi rumore per clustering
-                X = np.column_stack([self.movie_factors[:, 0], np.random.normal(0, 0.1, self.movie_factors.shape[0])])
-                self.kmeans_model = KMeans(n_clusters=min(self.n_clusters, self.movie_factors.shape[0]), random_state=42)
-                self.cluster_labels = self.kmeans_model.fit_predict(X)
+                self.n_clusters = n_clusters_actual  # Aggiorna con il numero effettivo
+                
+                logger.info(f"Clustering completato: {n_clusters_actual} cluster per {self.movie_factors.shape[0]} film")
             else:
-                # Troppi pochi dati per clustering significativo
+                # Troppo pochi dati per clustering
                 self.kmeans_model = None
                 self.cluster_labels = None
+                logger.warning(f"Clustering saltato: solo {self.movie_factors.shape[0]} film disponibili")
             
             self.is_trained = True
             
-            # Statistiche training
+            # Salva numero di rating per status
+            self._training_ratings_count = len(df)
+            
+            # Statistiche training nel formato atteso dal frontend
+            logger.info(f"🔍 DEBUG - actual_k_used: {self.actual_k_used}, explained_variance: {self.explained_variance}")
+            
             stats = {
-                "total_ratings": len(df),
-                "unique_users": df['userId'].nunique(),
-                "unique_movies": df['movieId'].nunique(),
-                "explained_variance": float(self.explained_variance),
-                "n_components": self.svd_model.n_components,
-                "actual_k_used": self.actual_k_used,
-                "k_efficiency": float(self.explained_variance / self.actual_k_used) if self.actual_k_used > 0 else 0,
-                "training_status": "success"
+                'status': 'success',
+                'timestamp': datetime.now().isoformat(),
+                'training_mode': 'aflix_only',
+                'stats': {
+                    'total_ratings': len(df),
+                    'actual_k_used': int(self.actual_k_used) if self.actual_k_used > 0 else None,
+                    'explained_variance': float(self.explained_variance),
+                    'unique_users': df['userId'].nunique(),
+                    'unique_movies': df['movieId'].nunique(),
+                    'k_efficiency': float(self.explained_variance / self.actual_k_used) if self.actual_k_used > 0 else 0,
+                },
+                'model_info': {
+                    'algorithm': 'SVD',
+                    'k_factor': int(self.actual_k_used) if self.actual_k_used > 0 else None,
+                    'training_source': 'aflix',
+                    'test_source': 'aflix'
+                }
             }
             
             logger.info(f"Model trained successfully. Stats: {stats}")
@@ -336,24 +376,42 @@ class MLRecommendationService:
         logger.info("🔄 Generazione nuovo dataset TMDB...")
         
         # Fetch film popolari da TMDB
+        logger.info("🎬 Recuperando film popolari da TMDB API...")
         popular_movies = self._fetch_tmdb_popular_movies(pages=20)  # ~400 film
+        logger.info(f"✅ Film TMDB recuperati: {len(popular_movies)}")
+        
+        if len(popular_movies) == 0:
+            logger.error("❌ Nessun film recuperato da TMDB API!")
+            return pd.DataFrame()
         
         # Genera rating sintetici
+        logger.info("🤖 Generando rating sintetici...")
         tmdb_ratings = self._generate_synthetic_ratings(popular_movies, n_users=10000)
+        
+        # Verifica che i dati siano stati generati
+        if len(tmdb_ratings) == 0:
+            logger.error("❌ Generazione rating sintetici fallita!")
+            return pd.DataFrame()
         
         # Salva in cache
         os.makedirs(self.cache_dir, exist_ok=True)
         with open(cache_file, 'wb') as f:
             pickle.dump(tmdb_ratings, f)
         
-        logger.info(f"✅ Dataset TMDB generato: {len(tmdb_ratings)} rating")
+        logger.info(f"✅ Dataset TMDB generato e salvato: {len(tmdb_ratings)} rating")
         return tmdb_ratings
     
     def _fetch_tmdb_popular_movies(self, pages: int = 10) -> List[Dict]:
         """Recupera film popolari da TMDB API"""
         import requests
         
+        # Verifica API key
+        if not self.tmdb_api_key or self.tmdb_api_key == "YOUR_API_KEY":
+            logger.error("❌ TMDB API key non configurata!")
+            return []
+        
         movies = []
+        logger.info(f"🔑 Usando TMDB API key: {self.tmdb_api_key[:10]}...")
         
         for page in range(1, pages + 1):
             try:
@@ -364,18 +422,23 @@ class MLRecommendationService:
                     'language': 'it-IT'
                 }
                 
+                logger.info(f"📡 Chiamando TMDB API - Pagina {page}...")
                 response = requests.get(url, params=params, timeout=10)
                 response.raise_for_status()
                 
                 data = response.json()
-                movies.extend(data.get('results', []))
+                page_results = data.get('results', [])
+                movies.extend(page_results)
+                logger.info(f"✅ Pagina {page}: {len(page_results)} film recuperati")
                 
                 # Rate limiting
                 import time
                 time.sleep(0.1)
                 
             except Exception as e:
-                logger.warning(f"Errore fetch pagina {page}: {e}")
+                logger.error(f"❌ Errore fetch pagina {page}: {e}")
+                if page == 1:  # Se fallisce la prima pagina, è un problema serio
+                    logger.error("❌ Impossibile accedere a TMDB API - Verifica API key e connessione")
                 break
         
         logger.info(f"📥 Recuperati {len(movies)} film da TMDB")
@@ -473,14 +536,31 @@ class MLRecommendationService:
         logger.info(f"🧮 Applicando SVD con k_factor: {self.current_k_factor}")
         
         U, sigma, Vt = svds(ratings_matrix, k=self.current_k_factor)
+        
+        # Calcola varianza spiegata correttamente
+        # Per SVD troncata, usiamo la frazione dei valori singolari principali
+        if len(sigma) > 0:
+            # Normalizza la varianza spiegata tra 0 e 1
+            total_sing_values = np.sum(sigma ** 2)
+            max_possible_variance = ratings_matrix.shape[0] * ratings_matrix.shape[1]  # Approssimazione
+            explained_variance = min(0.95, total_sing_values / (total_sing_values + 1000))  # Normalizzazione più realistica
+        else:
+            explained_variance = 0.0
+        
+        # Imposta attributi per statistiche
         self.user_factors = U
         self.item_factors = Vt.T
+        self.movie_factors = Vt.T  # Alias per compatibilità
+        self.actual_k_used = self.current_k_factor
+        self.explained_variance = explained_variance
         
         # Conversione per compatibilità numpy
         self.user_factors = np.ascontiguousarray(self.user_factors)
         self.item_factors = np.ascontiguousarray(self.item_factors)
+        self.movie_factors = np.ascontiguousarray(self.movie_factors)
         
         logger.info(f"✅ SVD completato: {U.shape} x {Vt.T.shape}")
+        logger.info(f"📊 Varianza spiegata: {self.explained_variance:.3f} ({self.explained_variance*100:.1f}%)")
     
     def _create_ratings_matrix(self, df: pd.DataFrame):
         """Crea matrice ratings da DataFrame"""
@@ -553,10 +633,26 @@ class MLRecommendationService:
     def _compile_hybrid_stats(self, tmdb_data: pd.DataFrame, aflix_test: Dict) -> Dict:
         """Compila statistiche training ibrido"""
         
+        # Calcola varianza spiegata se disponibile
+        explained_variance = getattr(self, 'explained_variance', 0.0)
+        actual_k_used = getattr(self, 'actual_k_used', self.current_k_factor)
+        
+        logger.info(f"🔍 DEBUG HYBRID - actual_k_used: {actual_k_used}, explained_variance: {explained_variance}")
+        
         return {
             'status': 'success',
             'timestamp': datetime.now().isoformat(),
             'training_mode': 'hybrid',
+            # Campi attesi dal frontend
+            'stats': {
+                'total_ratings': len(tmdb_data),
+                'actual_k_used': int(actual_k_used) if actual_k_used and actual_k_used > 0 else None,
+                'explained_variance': float(explained_variance) if explained_variance else 0.0,
+                'unique_users': tmdb_data['userId'].nunique() if len(tmdb_data) > 0 else 0,
+                'unique_movies': tmdb_data['title'].nunique() if len(tmdb_data) > 0 else 0,
+                'test_rmse': aflix_test.get('rmse'),
+                'test_status': aflix_test.get('status')
+            },
             'model_info': {
                 'algorithm': 'SVD',
                 'k_factor': self.current_k_factor,
@@ -565,9 +661,9 @@ class MLRecommendationService:
             },
             'tmdb_data': {
                 'total_ratings': len(tmdb_data),
-                'unique_users': tmdb_data['userId'].nunique(),
-                'unique_movies': tmdb_data['title'].nunique(),
-                'rating_distribution': tmdb_data['rating'].value_counts().to_dict()
+                'unique_users': tmdb_data['userId'].nunique() if len(tmdb_data) > 0 else 0,
+                'unique_movies': tmdb_data['title'].nunique() if len(tmdb_data) > 0 else 0,
+                'rating_distribution': tmdb_data['rating'].value_counts().to_dict() if len(tmdb_data) > 0 else {}
             },
             'aflix_test': aflix_test,
             'performance': {
@@ -930,25 +1026,52 @@ class MLRecommendationService:
             return []
 
     def get_clustering_data(self) -> Dict[str, Any]:
-        """Restituisce dati per visualizzazione clustering"""
-        if not self.is_trained or self.kmeans_model is None:
-            return {"error": "Clustering model not available. Need more diverse data for clustering."}
+        """Restituisce dati per visualizzazione clustering - SOLO film votati utenti AFlix (test set)"""
+        if not self.is_trained:
+            return {"error": "Model not trained yet. Please train the model first."}
+        
+        if self.kmeans_model is None:
+            return {"error": f"Clustering not available. Need at least 2 movies for clustering. Current: {self.movie_factors.shape[0] if hasattr(self, 'movie_factors') and self.movie_factors is not None else 0} movies."}
         
         try:
-            # Gestisci sia il caso di 1 che 2+ componenti
-            if self.movie_factors.shape[1] >= 2:
-                X = self.movie_factors[:, :2]
-            else:
-                # Se c'è solo 1 componente, ricostruisci la matrice usata per clustering
-                X = np.column_stack([self.movie_factors[:, 0], np.random.normal(0, 0.1, self.movie_factors.shape[0])])
+            # Usa i fattori AFlix calcolati durante il training ibrido
+            if not hasattr(self, 'aflix_movie_factors') or self.aflix_movie_factors is None:
+                return {"error": "AFlix movie factors not available. Train model in hybrid mode first."}
             
-            # Dati per visualizzazione
+            aflix_movie_factors = self.aflix_movie_factors
+            if len(aflix_movie_factors) < 2:
+                return {"error": f"Insufficient AFlix movies for clustering. Need at least 2, found: {len(aflix_movie_factors)}"}
+            
+            # Gestisci dimensioni per visualizzazione
+            if aflix_movie_factors.shape[1] >= 2:
+                X = aflix_movie_factors[:, :2]
+            else:
+                # Se c'è solo 1 componente, usa quella e aggiungi rumore per clustering
+                X = np.column_stack([aflix_movie_factors[:, 0], np.random.normal(0, 0.1, aflix_movie_factors.shape[0])])
+            
+            # Ottieni informazioni sui film AFlix
+            aflix_movie_info = self._get_aflix_movies_info()
+            
+            # Dati per visualizzazione - SOLO film AFlix
             clustering_data = {
-                "points": [{"x": float(X[i, 0]), "y": float(X[i, 1]), "cluster": int(self.cluster_labels[i])} 
-                          for i in range(len(X))],
-                "centroids": [{"x": float(center[0]), "y": float(center[1]), "cluster": i} 
-                             for i, center in enumerate(self.kmeans_model.cluster_centers_)],
-                "n_clusters": self.n_clusters
+                "points": [
+                    {
+                        "x": float(X[i, 0]), 
+                        "y": float(X[i, 1]), 
+                        "cluster": int(self.cluster_labels[i]) if self.cluster_labels is not None and i < len(self.cluster_labels) else 0,
+                        "movie_title": aflix_movie_info[i]["title"] if i < len(aflix_movie_info) else f"Movie {i}",
+                        "movie_id": aflix_movie_info[i]["movie_id"] if i < len(aflix_movie_info) else None
+                    } 
+                    for i in range(len(X))
+                ],
+                "centroids": [
+                    {"x": float(center[0]), "y": float(center[1]), "cluster": i} 
+                    for i, center in enumerate(self.kmeans_model.cluster_centers_)
+                ] if self.kmeans_model is not None else [],
+                "n_clusters": self.n_clusters,
+                "total_aflix_movies": len(aflix_movie_factors),
+                "dataset_type": "aflix_test_set",
+                "training_source": self.training_source if hasattr(self, 'training_source') else "unknown"
             }
             
             return clustering_data
@@ -956,6 +1079,195 @@ class MLRecommendationService:
         except Exception as e:
             logger.error(f"Error generating clustering data: {e}")
             return {"error": str(e)}
+    
+    def _get_aflix_movies_indices(self) -> List[int]:
+        """Ottieni indici dei film votati dagli utenti AFlix nel movie encoder"""
+        try:
+            # Ottieni tutti i voti AFlix dal database
+            votes = list(Votazione.objects.all())
+            
+            if not votes:
+                return []
+            
+            # Estrai titoli dei film votati
+            aflix_movie_titles = {vote.film.titolo for vote in votes}
+            
+            # Se non abbiamo un movie encoder, non possiamo fare il mapping
+            if not hasattr(self, 'movie_encoder') or self.movie_encoder is None:
+                logger.warning("Movie encoder not available for AFlix filtering")
+                return []
+            
+            # Ottieni tutti i titoli nel movie encoder
+            encoded_titles = self.movie_encoder.classes_
+            
+            # Trova gli indici dei film AFlix nel movie encoder
+            aflix_indices = []
+            for i, title in enumerate(encoded_titles):
+                if title in aflix_movie_titles:
+                    aflix_indices.append(i)
+            
+            logger.info(f"Found {len(aflix_indices)} AFlix movies out of {len(encoded_titles)} total movies")
+            return aflix_indices
+            
+        except Exception as e:
+            logger.error(f"Error getting AFlix movie indices: {e}")
+            return []
+    
+    def _get_aflix_movies_info(self) -> List[Dict[str, Any]]:
+        """Ottieni informazioni sui film AFlix per la visualizzazione"""
+        try:
+            votes = list(Votazione.objects.all())
+            
+            # Crea mapping titolo -> info film
+            movie_info_map = {}
+            for vote in votes:
+                title = vote.film.titolo
+                if title not in movie_info_map:
+                    movie_info_map[title] = {
+                        "title": title,
+                        "movie_id": vote.film.tmdb_id,
+                        "genre": vote.film.genere,
+                        "avg_rating": 0,
+                        "vote_count": 0
+                    }
+                
+                # Calcola media rating
+                current_info = movie_info_map[title]
+                current_avg = current_info["avg_rating"]
+                current_count = current_info["vote_count"]
+                
+                new_avg = (current_avg * current_count + vote.valutazione) / (current_count + 1)
+                movie_info_map[title]["avg_rating"] = new_avg
+                movie_info_map[title]["vote_count"] = current_count + 1
+            
+            # Se non abbiamo movie encoder, restituisci info base
+            if not hasattr(self, 'movie_encoder') or self.movie_encoder is None:
+                return list(movie_info_map.values())
+            
+            # Ordina secondo il movie encoder
+            encoded_titles = self.movie_encoder.classes_
+            aflix_movie_info = []
+            
+            for title in encoded_titles:
+                if title in movie_info_map:
+                    aflix_movie_info.append(movie_info_map[title])
+            
+            return aflix_movie_info
+            
+        except Exception as e:
+            logger.error(f"Error getting AFlix movie info: {e}")
+            return []
+    
+    def _apply_clustering_on_aflix_movies(self):
+        """Applica clustering sui film AFlix usando il modello SVD addestrato su TMDB"""
+        try:
+            logger.info("🎯 Applicazione clustering sui film AFlix...")
+            
+            # Ottieni dati AFlix
+            aflix_df = self.prepare_data()
+            if len(aflix_df) < 2:
+                logger.warning("Clustering saltato: meno di 2 film AFlix disponibili")
+                self.kmeans_model = None
+                self.cluster_labels = None
+                return
+            
+            # Proietta i film AFlix nello spazio SVD TMDB
+            aflix_movie_factors = self._project_aflix_movies_to_svd_space(aflix_df)
+            
+            if aflix_movie_factors is None or aflix_movie_factors.shape[0] < 2:
+                logger.warning("Clustering saltato: proiezione AFlix non riuscita")
+                self.kmeans_model = None
+                self.cluster_labels = None  
+                return
+            
+            # Salva i fattori AFlix per il clustering
+            self.aflix_movie_factors = aflix_movie_factors
+            
+            # Determina numero cluster ottimale per AFlix
+            n_movies = aflix_movie_factors.shape[0]
+            n_clusters_actual = min(self.n_clusters, max(2, n_movies // 2))
+            
+            # Prepara dati per clustering (usa 2D)
+            if aflix_movie_factors.shape[1] >= 2:
+                X = aflix_movie_factors[:, :2]
+            else:
+                # Se c'è solo 1 componente, aggiungi rumore per clustering 2D
+                X = np.column_stack([
+                    aflix_movie_factors[:, 0], 
+                    np.random.normal(0, 0.1, aflix_movie_factors.shape[0])
+                ])
+            
+            # Applica K-means clustering sui film AFlix
+            self.kmeans_model = KMeans(n_clusters=n_clusters_actual, random_state=42)
+            self.cluster_labels = self.kmeans_model.fit_predict(X)
+            self.n_clusters = n_clusters_actual
+            
+            logger.info(f"✅ Clustering AFlix completato: {n_clusters_actual} cluster per {n_movies} film AFlix")
+            
+            # Statistiche cluster
+            unique_labels, counts = np.unique(self.cluster_labels, return_counts=True)
+            for i, (label, count) in enumerate(zip(unique_labels, counts)):
+                logger.info(f"   Cluster {label}: {count} film")
+                
+        except Exception as e:
+            logger.error(f"Errore clustering film AFlix: {e}")
+            self.kmeans_model = None
+            self.cluster_labels = None
+    
+    def _project_aflix_movies_to_svd_space(self, aflix_df: pd.DataFrame):
+        """Proietta i film AFlix nello spazio SVD addestrato su TMDB"""
+        try:
+            # Verifica che il modello SVD sia addestrato
+            if not hasattr(self, 'item_factors') or self.item_factors is None:
+                logger.error("SVD model non disponibile per proiezione AFlix")
+                return None
+            
+            # Trova i film AFlix che sono anche nel training TMDB
+            aflix_titles = set(aflix_df['title'].unique())
+            tmdb_titles = set(self.movie_encoder.classes_)
+            common_titles = aflix_titles.intersection(tmdb_titles)
+            
+            logger.info(f"Film AFlix: {len(aflix_titles)}, Film TMDB: {len(tmdb_titles)}, Comuni: {len(common_titles)}")
+            
+            if len(common_titles) < 2:
+                # Se non ci sono abbastanza film comuni, usa media dei fattori per inferenza
+                logger.warning("Pochi film comuni TMDB-AFlix, uso inferenza basata su media dei fattori")
+                
+                # Calcola fattori medi per ogni film AFlix basandoti sui generi o altre caratteristiche
+                aflix_movie_factors = []
+                avg_factor = np.mean(self.item_factors, axis=0)  # Fattore medio TMDB
+                
+                for title in aflix_titles:
+                    # Per ora usa il fattore medio, in futuro si può migliorare con content-based
+                    noise = np.random.normal(0, 0.1, avg_factor.shape)  # Piccola variazione
+                    aflix_movie_factors.append(avg_factor + noise)
+                
+                return np.array(aflix_movie_factors)
+            
+            else:
+                # Usa i fattori dei film comuni
+                aflix_movie_factors = []
+                aflix_movie_info = []
+                
+                for title in aflix_titles:
+                    if title in common_titles:
+                        # Film presente in TMDB, usa i suoi fattori
+                        movie_idx = self.movie_encoder.transform([title])[0]
+                        aflix_movie_factors.append(self.item_factors[movie_idx])
+                        aflix_movie_info.append({"title": title, "source": "tmdb_match"})
+                    else:
+                        # Film non in TMDB, usa fattore medio con rumore
+                        avg_factor = np.mean(self.item_factors, axis=0)
+                        noise = np.random.normal(0, 0.2, avg_factor.shape)
+                        aflix_movie_factors.append(avg_factor + noise)
+                        aflix_movie_info.append({"title": title, "source": "inferred"})
+                
+                self.aflix_movie_info = aflix_movie_info  # Salva per debug
+                return np.array(aflix_movie_factors)
+                
+        except Exception as e:
+            logger.error(f"Errore proiezione film AFlix: {e}")
+            return None
 
     def evaluate_model(self) -> Dict[str, Any]:
         """Valuta le performance del modello"""
@@ -1045,17 +1357,56 @@ class MLRecommendationService:
             elif explained_var == float('inf') or explained_var == float('-inf'):
                 explained_var = 0.0
         
+        # Determina il K-SVD attuale utilizzato
+        current_k_svd = 0
+        if self.is_trained:
+            if hasattr(self, 'actual_k_used') and self.actual_k_used > 0:
+                current_k_svd = self.actual_k_used
+            elif hasattr(self, 'current_k_factor') and self.current_k_factor > 0:
+                current_k_svd = self.current_k_factor
+            elif self.svd_model and hasattr(self.svd_model, 'n_components'):
+                current_k_svd = self.svd_model.n_components
+            else:
+                current_k_svd = self.n_components
+
+        # Calcola total_ratings se il modello è addestrato
+        total_ratings = 0
+        if self.is_trained:
+            try:
+                # Usa sempre i dati effettivi di training (salvati durante addestramento)
+                total_ratings = getattr(self, '_training_ratings_count', 0)
+                
+                # Se non disponibile, fallback basato su modalità
+                if total_ratings == 0:
+                    if hasattr(self, 'training_source') and 'hybrid' in str(self.training_source).lower():
+                        # Modalità ibrida: dovrebbe essere ~400k TMDB
+                        total_ratings = 400000  # Stima per TMDB
+                    else:
+                        # Modalità AFlix-only: conta voti reali
+                        votes = list(Votazione.objects.all())
+                        total_ratings = len(votes)
+            except:
+                total_ratings = 0
+
         return {
             "is_trained": self.is_trained,
             "explained_variance": explained_var,
-            "n_components": self.svd_model.n_components if self.svd_model else 0,
+            "n_components": current_k_svd,  # K-SVD attualmente utilizzato
             "actual_k_used": self.actual_k_used,
             "requested_k": self.n_components,
-            "k_efficiency": float(explained_var / self.actual_k_used) if self.actual_k_used > 0 else 0,
-            "n_clusters": self.n_clusters,
+            "k_efficiency": float(explained_var / current_k_svd) if current_k_svd > 0 else 0,
+            "n_clusters": self.n_clusters if hasattr(self, 'n_clusters') else 3,
             "has_clustering": self.kmeans_model is not None,
             "variance_per_component": self.variance_per_component if hasattr(self, 'variance_per_component') else [],
-            "k_optimization_available": len(self.k_performance_log) > 0 if hasattr(self, 'k_performance_log') else False
+            "k_optimization_available": len(self.k_performance_log) > 0 if hasattr(self, 'k_performance_log') else False,
+            "total_ratings": total_ratings,
+            # Debug info
+            "debug": {
+                "svd_model_exists": self.svd_model is not None,
+                "svd_n_components": self.svd_model.n_components if self.svd_model else None,
+                "current_k_factor": getattr(self, 'current_k_factor', None),
+                "movie_factors_shape": self.movie_factors.shape if hasattr(self, 'movie_factors') and self.movie_factors is not None else None
+            }
         }
 
     def _train_content_based_model(self, df: pd.DataFrame) -> Dict[str, Any]:

@@ -24,35 +24,35 @@ api.interceptors.request.use(
 
 // API methods
 export const authAPI = {
-  register: (userData) => api.post('/auth/register', userData),
-  login: (credentials) => api.post('/auth/login', credentials),
+  register: (userData) => api.post('/api/auth/register', userData),
+  login: (credentials) => api.post('/api/auth/login', credentials),
 };
 
 export const onboardingAPI = {
-  getGenres: () => api.get('/onboarding/genres'),
-  selectGenres: (userId, genres) => api.post(`/onboarding/select-genres/${userId}`, genres),
-  getMoviesForRating: (userId) => api.get(`/onboarding/movies-for-rating/${userId}`),
+  getGenres: () => api.get('/api/onboarding/genres'),
+  selectGenres: (userId, genres) => api.post(`/api/onboarding/select-genres/${userId}`, genres),
+  getMoviesForRating: (userId) => api.get(`/api/onboarding/movies-for-rating/${userId}`),
 };
 
 export const ratingsAPI = {
-  voteMovie: (userId, voteData) => api.post(`/ratings/vote/${userId}`, voteData),
-  voteMultipleMovies: (userId, votesData) => api.post(`/ratings/vote-multiple/${userId}`, votesData),
-  getUserRatings: (userId) => api.get(`/ratings/user-ratings/${userId}`),
+  voteMovie: (userId, voteData) => api.post(`/api/ratings/vote/${userId}`, voteData),
+  voteMultipleMovies: (userId, votesData) => api.post(`/api/ratings/vote-multiple/${userId}`, votesData),
+  getUserRatings: (userId) => api.get(`/api/ratings/user-ratings/${userId}`),
 };
 
 export const recommendationsAPI = {
   // Nuovi endpoint ML
-  getRecommendations: (userId, topN = 10) => api.get(`/recommendations/user/${userId}?top_n=${topN}`),
-  getUserHistory: (userId) => api.get(`/recommendations/user/${userId}/history`),
-  getModelStatus: () => api.get('/recommendations/status'),
-  trainModel: () => api.get('/recommendations/train-sync'),
-  trainModelAsync: () => api.post('/recommendations/train'),
-  getEvaluation: () => api.get('/recommendations/evaluation'),
-  getClustering: () => api.get('/recommendations/clustering'),
-  getPopularRecommendations: (topN = 10) => api.get(`/recommendations/popular?top_n=${topN}`),
+  getRecommendations: (userId, topN = 10) => api.get(`/api/recommendations/user/${userId}?top_n=${topN}`),
+  getUserHistory: (userId) => api.get(`/api/recommendations/user/${userId}/history`),
+  getModelStatus: () => api.get('/api/recommendations/status'),
+  trainModel: () => api.get('/api/recommendations/train-sync'),
+  trainModelAsync: () => api.post('/api/recommendations/train'),
+  getEvaluation: () => api.get('/api/recommendations/evaluation'),
+  getClustering: () => api.get('/api/recommendations/clustering'),
+  getPopularRecommendations: (topN = 10) => api.get(`/api/recommendations/popular?top_n=${topN}`),
   
   // Backward compatibility (deprecated)
-  getUserStats: (userId) => api.get(`/recommendations/user/${userId}/history`),
+  getUserStats: (userId) => api.get(`/api/recommendations/user/${userId}/history`),
 };
 
 // Utility functions

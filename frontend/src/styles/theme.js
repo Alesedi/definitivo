@@ -15,6 +15,7 @@ export const theme = {
 
     // Neutral colors
     background: '#F8FAFC',    // Very light gray
+    backgroundLight: '#F1F5F9', // Light background
     surface: '#FFFFFF',       // White
     surfaceHover: '#F1F5F9',  // Light gray
     

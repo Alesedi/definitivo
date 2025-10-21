@@ -23,7 +23,7 @@ const MLMonitor = () => {
   // Recupera status del modello
   const fetchModelStatus = async () => {
     try {
-      const response = await fetch(`${API_BASE}/admin/ml/live-monitor`);
+      const response = await fetch(`${API_BASE}/api/admin/ml/live-monitor`);
       if (response.ok) {
         const data = await response.json();
         setModelStatus(data);
@@ -43,7 +43,7 @@ const MLMonitor = () => {
     addLog('🚀 Avvio training del modello...', 'info');
     
     try {
-      const response = await fetch(`${API_BASE}/recommendations/train-sync`);
+      const response = await fetch(`${API_BASE}/api/recommendations/train-sync`);
       if (response.ok) {
         const result = await response.json();
         addLog('✅ Training completato con successo!', 'success');
@@ -118,7 +118,7 @@ const MLMonitor = () => {
     addLog(`🎯 Testing K range: [${k_range.join(', ')}]`, 'info');
     
     try {
-      const response = await fetch(`${API_BASE}/admin/ml/optimize-k-factor`, {
+      const response = await fetch(`${API_BASE}/api/admin/ml/optimize-k-factor`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json'
@@ -164,7 +164,7 @@ const MLMonitor = () => {
   // Analisi fattore K
   const fetchKAnalysis = async () => {
     try {
-      const response = await fetch(`${API_BASE}/admin/ml/k-factor-analysis`);
+      const response = await fetch(`${API_BASE}/api/admin/ml/k-factor-analysis`);
       if (response.ok) {
         const analysis = await response.json();
         

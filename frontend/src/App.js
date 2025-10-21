@@ -10,12 +10,10 @@ import RegisterPage from './pages/RegisterPage';
 import OnboardingPage from './pages/OnboardingPage';
 import DashboardPage from './pages/DashboardPage';
 import RatingPage from './pages/RatingPage';
-import RecommendationsPage from './pages/RecommendationsPage';
+import MLDashboard from './pages/MLDashboard';
 
 // Import components
 import Navbar from './components/Navbar';
-import MLMonitor from './components/MLMonitor';
-import KOptimizationMonitor from './components/KOptimizationMonitor';
 import { getAuthToken } from './services/api';
 
 function App() {
@@ -123,30 +121,10 @@ function App() {
               } 
             />
             <Route 
-              path="/recommendations" 
+              path="/ml-dashboard" 
               element={
                 user ? (
-                  <RecommendationsPage user={user} />
-                ) : (
-                  <Navigate to="/login" replace />
-                )
-              } 
-            />
-            <Route 
-              path="/ml-monitor" 
-              element={
-                user ? (
-                  <MLMonitor />
-                ) : (
-                  <Navigate to="/login" replace />
-                )
-              } 
-            />
-            <Route 
-              path="/k-optimization" 
-              element={
-                user ? (
-                  <KOptimizationMonitor />
+                  <MLDashboard user={user} />
                 ) : (
                   <Navigate to="/login" replace />
                 )

@@ -11,6 +11,18 @@ from datetime import datetime
 import json
 import asyncio
 import time
+import numpy as np
+from scipy.sparse.linalg import svds
+from sklearn.preprocessing import LabelEncoder
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
+from scipy.sparse import csr_matrix
+
+def safe_float(value):
+    """Converte un valore in float sicuro per JSON, gestendo NaN e infiniti"""
+    if np.isnan(value) or np.isinf(value):
+        return 0.0
+    return float(value)
 
 class KFactorOptimizationRequest(BaseModel):
     k_range: Optional[List[int]] = None
@@ -422,9 +434,6 @@ async def stream_k_optimization():
             # Crea matrice
             yield f"data: {json.dumps({'type': 'status', 'message': 'Creazione matrice ratings...', 'progress': 10})}\n\n"
             
-            from sklearn.preprocessing import LabelEncoder
-            from scipy.sparse import csr_matrix
-            
             user_encoder = LabelEncoder()
             movie_encoder = LabelEncoder()
             df['user_idx'] = user_encoder.fit_transform(df['userId'])
@@ -437,61 +446,97 @@ async def stream_k_optimization():
             
             yield f"data: {json.dumps({'type': 'matrix_info', 'shape': ratings_matrix.shape, 'density': ratings_matrix.nnz / (ratings_matrix.shape[0] * ratings_matrix.shape[1])})}\n\n"
             
+            # Inizializza variabili per K ottimali
+            optimal_k_svd_final = getattr(ml_service, 'current_k_factor', 30)
+            
             # Ottimizzazione K-SVD
             if ml_service.auto_optimize_k_svd:
                 yield f"data: {json.dumps({'type': 'phase', 'phase': 'k_svd', 'message': 'Inizio ottimizzazione K-SVD...', 'progress': 20})}\n\n"
                 
-                best_k_svd = None
-                best_score_svd = -1
-                total_k_svd = len(list(ml_service.k_svd_range))
+                # Calcola range K dinamico basato sulla matrice
+                max_k_possible = min(ratings_matrix.shape) - 1
                 
-                for i, k in enumerate(ml_service.k_svd_range):
-                    try:
-                        # Limite sicurezza
-                        max_k = min(ratings_matrix.shape) - 1
-                        if k >= max_k:
+                # Range K-SVD più intelligente per dataset piccoli
+                if max_k_possible <= 2:
+                    # Dataset troppo piccolo - salta ottimizzazione K-SVD
+                    yield f"data: {json.dumps({'type': 'warning', 'message': f'Dataset troppo piccolo per K-SVD (max_k={max_k_possible}). Usando K di default.'})}\n\n"
+                    k_range = []
+                elif max_k_possible <= 10:
+                    # Dataset piccolo: testa valori disponibili
+                    k_range = list(range(2, max_k_possible + 1))
+                elif max_k_possible <= 20:
+                    # Dataset medio: range più ampio
+                    k_range = list(range(2, max_k_possible + 1, 2))  # Step 2 per non sovraccaricare
+                else:
+                    # Dataset grande: range selettivo
+                    k_range = list(range(2, 16)) + list(range(20, min(max_k_possible + 1, 51), 5))
+                
+                if len(k_range) == 0:
+                    best_k_svd = None
+                else:
+                    
+                    yield f"data: {json.dumps({'type': 'status', 'message': f'Range K-SVD: {min(k_range)}-{max(k_range)} ({len(k_range)} valori) [Matrice: {ratings_matrix.shape}]', 'progress': 22})}\n\n"
+                    
+                    best_k_svd = None
+                    best_score_svd = -1
+                    total_k_svd = len(k_range)
+                    
+                    for i, k in enumerate(k_range):
+                        try:
+                            # Limite sicurezza
+                            max_k_check = min(ratings_matrix.shape) - 1
+                            if k >= max_k_check:
+                                continue
+                            
+                            # Test SVD
+                            U, sigma, Vt = svds(ratings_matrix, k=k)
+                            
+                            # Calcola metriche
+                            total_variance = np.sum(sigma ** 2)
+                            explained_variance = total_variance / (ratings_matrix.nnz if hasattr(ratings_matrix, 'nnz') else ratings_matrix.size)
+                            efficiency = explained_variance / k
+                            composite_score = explained_variance * 0.7 + efficiency * 0.3
+                            
+                            # Determina se è il migliore
+                            is_best = composite_score > best_score_svd
+                            if is_best:
+                                best_score_svd = composite_score
+                                best_k_svd = k
+                                yield f"data: {json.dumps({'type': 'status', 'message': f'Nuovo K-SVD migliore: {k} (score: {composite_score:.4f})'})}\n\n"
+                            
+                            # Stream risultato
+                            progress = 20 + (i / total_k_svd * 40)  # 20-60%
+                            result = {
+                                'type': 'k_svd_result',
+                                'k': int(k),
+                                'explained_variance': safe_float(explained_variance),
+                                'efficiency': safe_float(efficiency),
+                                'composite_score': safe_float(composite_score),
+                                'is_best': bool(is_best),  # Conversione esplicita
+                                'progress': int(progress)
+                            }
+                            yield f"data: {json.dumps(result)}\n\n"
+                            time.sleep(0.1)  # Simula calcolo
+                            
+                        except Exception as e:
+                            yield f"data: {json.dumps({'type': 'warning', 'message': f'Errore K-SVD {k}: {str(e)}'})}\n\n"
                             continue
-                        
-                        # Test SVD
-                        from scipy.sparse.linalg import svds
-                        import numpy as np
-                        
-                        U, sigma, Vt = svds(ratings_matrix, k=k)
-                        
-                        # Calcola metriche
-                        total_variance = np.sum(sigma ** 2)
-                        explained_variance = total_variance / (ratings_matrix.nnz if hasattr(ratings_matrix, 'nnz') else ratings_matrix.size)
-                        efficiency = explained_variance / k
-                        composite_score = explained_variance * 0.7 + efficiency * 0.3
-                        
-                        # Determina se è il migliore
-                        is_best = composite_score > best_score_svd
-                        if is_best:
-                            best_score_svd = composite_score
-                            best_k_svd = k
-                        
-                        # Stream risultato
-                        progress = 20 + (i / total_k_svd * 40)  # 20-60%
-                        result = {
-                            'type': 'k_svd_result',
-                            'k': k,
-                            'explained_variance': float(explained_variance),
-                            'efficiency': float(efficiency),
-                            'composite_score': float(composite_score),
-                            'is_best': is_best,
-                            'progress': int(progress)
-                        }
-                        yield f"data: {json.dumps(result)}\n\n"
-                        time.sleep(0.1)  # Simula calcolo
-                        
-                    except Exception as e:
-                        yield f"data: {json.dumps({'type': 'warning', 'message': f'Errore K-SVD {k}: {str(e)}'})}\n\n"
-                        continue
                 
+                # Imposta il K ottimale trovato per il messaggio finale
                 if best_k_svd:
-                    ml_service.n_components = best_k_svd
-                    ml_service.current_k_factor = best_k_svd
-                    yield f"data: {json.dumps({'type': 'k_svd_optimal', 'optimal_k': best_k_svd, 'score': float(best_score_svd)})}\n\n"
+                    # K ottimale trovato per test set AFlix
+                    optimal_k_svd_final = best_k_svd
+                    yield f"data: {json.dumps({'type': 'k_svd_optimal', 'optimal_k': int(best_k_svd), 'score': safe_float(best_score_svd), 'note': f'Ottimale per test set AFlix (training usa K={ml_service.current_k_factor})'})}\n\n"
+                else:
+                    # Strategia alternativa per dataset piccoli
+                    if len(k_range) == 0:
+                        # Dataset troppo piccolo - usa K attuale del training
+                        current_k = getattr(ml_service, 'current_k_factor', 50)
+                        optimal_k_svd_final = current_k
+                        yield f"data: {json.dumps({'type': 'k_svd_optimal', 'optimal_k': int(current_k), 'score': 0.0, 'note': f'K training ibrido (test set troppo piccolo per ottimizzazione)'})}\n\n"
+                    else:
+                        optimal_k_svd_final = getattr(ml_service, 'current_k_factor', 30)
+                        yield f"data: {json.dumps({'type': 'warning', 'message': 'Nessun K-SVD ottimale trovato'})}\n\n"
             
             # Ottimizzazione K-Cluster
             if ml_service.auto_optimize_k_cluster:
@@ -520,9 +565,6 @@ async def stream_k_optimization():
                         continue
                         
                     try:
-                        from sklearn.cluster import KMeans
-                        from sklearn.metrics import silhouette_score
-                        
                         # Test clustering
                         kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
                         labels = kmeans.fit_predict(cluster_data)
@@ -544,12 +586,12 @@ async def stream_k_optimization():
                         progress = 60 + (i / total_k_cluster * 30)  # 60-90%
                         result = {
                             'type': 'k_cluster_result',
-                            'k': k,
-                            'silhouette_score': float(silhouette),
-                            'balance': float(balance),
-                            'interpretability': float(interpretability),
-                            'composite_score': float(composite_score),
-                            'is_best': is_best,
+                            'k': int(k),
+                            'silhouette_score': safe_float(silhouette),
+                            'balance': safe_float(balance),
+                            'interpretability': safe_float(interpretability),
+                            'composite_score': safe_float(composite_score),
+                            'is_best': bool(is_best),  # Conversione esplicita
                             'progress': int(progress)
                         }
                         yield f"data: {json.dumps(result)}\n\n"
@@ -561,17 +603,20 @@ async def stream_k_optimization():
                 
                 if best_k_cluster:
                     ml_service.n_clusters = best_k_cluster
-                    yield f"data: {json.dumps({'type': 'k_cluster_optimal', 'optimal_k': best_k_cluster, 'score': float(best_score_cluster)})}\n\n"
+                    yield f"data: {json.dumps({'type': 'k_cluster_optimal', 'optimal_k': int(best_k_cluster), 'score': safe_float(best_score_cluster)})}\n\n"
             
-            # Completamento
-            yield f"data: {json.dumps({'type': 'completed', 'message': 'Ottimizzazione completata!', 'progress': 100, 'final_k_svd': ml_service.n_components, 'final_k_cluster': ml_service.n_clusters})}\n\n"
+            # Completamento - USA I K OTTIMALI TROVATI, NON I VALORI DI CONFIGURAZIONE
+            final_k_svd = optimal_k_svd_final if 'optimal_k_svd_final' in locals() else getattr(ml_service, 'current_k_factor', 30)
+            final_k_cluster = best_k_cluster if best_k_cluster else ml_service.n_clusters
+            
+            yield f"data: {json.dumps({'type': 'completed', 'message': 'Ottimizzazione completata con successo!', 'progress': 100, 'final_k_svd': int(final_k_svd), 'final_k_cluster': int(final_k_cluster)})}\n\n"
             
         except Exception as e:
             yield f"data: {json.dumps({'type': 'error', 'message': f'Errore generale: {str(e)}'})}\n\n"
     
     return StreamingResponse(
         generate_optimization_stream(),
-        media_type="text/plain",
+        media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
