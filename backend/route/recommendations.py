@@ -198,3 +198,26 @@ async def get_popular_recommendations(top_n: int = 10):
     except Exception as e:
         logger.error(f"Error getting popular recommendations: {e}")
         raise HTTPException(status_code=500, detail=f"Errore nel generare raccomandazioni popolari: {str(e)}")
+
+@router.get("/dashboard/{user_id}", response_model=List[RecommendationResponse])
+async def get_dashboard_recommendations(user_id: str):
+    """Raccomandazioni specifiche per dashboard utente (non random)"""
+    try:
+        # Verifica che l'utente esista
+        user = Utente.objects(id=user_id).first()
+        if not user:
+            # Se utente non esiste, usa raccomandazioni popolari
+            logger.warning(f"Dashboard: Utente {user_id} non trovato, uso raccomandazioni popolari")
+            recommendations = ml_service._get_popular_recommendations(top_n=6)
+        else:
+            # Usa raccomandazioni personalizzate
+            logger.info(f"Dashboard: Genero raccomandazioni personalizzate per utente {user_id}")
+            recommendations = ml_service.get_user_recommendations(user_id, top_n=6)
+        
+        return [RecommendationResponse(**rec) for rec in recommendations]
+        
+    except Exception as e:
+        logger.error(f"Error getting dashboard recommendations for user {user_id}: {e}")
+        # Fallback a raccomandazioni popolari
+        recommendations = ml_service._get_popular_recommendations(top_n=6)
+        return [RecommendationResponse(**rec) for rec in recommendations]

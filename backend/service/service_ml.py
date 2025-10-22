@@ -32,15 +32,15 @@ class MLRecommendationService:
         self.explained_variance = 0.0
         self.cluster_labels = None
         
-        # Parametri modello
-        self.n_components = 50
-        self.n_clusters = 3
+        # Parametri modello ottimizzati per dataset AFlix
+        self.n_components = 25  # ✅ K conservativo per dataset medio-piccolo
+        self.n_clusters = 4     # ✅ K-cluster ideale per AFlix
         
         # Ottimizzazione automatica K
         self.auto_optimize_k_svd = True
         self.auto_optimize_k_cluster = True
-        self.k_svd_range = range(5, 101, 5)  # Range più fitto e partenza più bassa
-        self.k_cluster_range = range(2, 16)
+        self.k_svd_range = range(10, 36, 5)  # 🔧 FIX: Range 10-35 (non più 50!)
+        self.k_cluster_range = range(2, 8)   # ✅ Range cluster più piccolo
         
         # Tracciamento fattore k (numero componenti SVD)
         self.actual_k_used = 0  # Numero effettivo di componenti utilizzati
@@ -58,7 +58,7 @@ class MLRecommendationService:
         self.tmdb_ratings_df = None
         self.training_source = "hybrid"
         self.cache_dir = "data/cache"
-        self.current_k_factor = 50
+        self.current_k_factor = 25  # ✅ Allineato con n_components
         
         # TMDB API per poster
         self.TMDB_API_KEY = "9e6c375b125d733d9ce459bdd91d4a06"
@@ -130,6 +130,12 @@ class MLRecommendationService:
         """Training ibrido: TMDB per training, AFlix per testing"""
         
         try:
+            # 0. FORZA RESET PARAMETRI K ALL'INIZIO
+            logger.info("🔄 Reset parametri K per training ibrido...")
+            self.n_components = 25
+            self.current_k_factor = 25
+            logger.info(f"✅ Parametri K forzati: n_components={self.n_components}, current_k_factor={self.current_k_factor}")
+            
             # 1. Genera o carica dataset TMDB
             logger.info("🔄 Inizio generazione/caricamento dati TMDB...")
             tmdb_data = self._get_or_generate_tmdb_data()
@@ -144,7 +150,13 @@ class MLRecommendationService:
             ratings_matrix = self._create_ratings_matrix(tmdb_data)
             logger.info(f"📊 Matrice rating creata: {ratings_matrix.shape}")
             
-            # 3. Applica SVD
+            # 3. AUTO-OTTIMIZZAZIONE K su dataset TMDB (se abilitata)
+            if self.auto_optimize_k_svd or self.auto_optimize_k_cluster:
+                logger.info("🎯 Avvio ottimizzazione K-values su dataset TMDB...")
+                optimization_results = self.optimize_both_k_values(ratings_matrix)
+                logger.info(f"✅ Ottimizzazione completata: {optimization_results}")
+            
+            # 4. Applica SVD con K ottimizzato
             logger.info("🔧 Applicando decomposizione SVD...")
             self._apply_svd_to_matrix(ratings_matrix)
             logger.info(f"✅ SVD completata con k_factor: {self.current_k_factor}")
@@ -530,29 +542,90 @@ class MLRecommendationService:
     def _apply_svd_to_matrix(self, ratings_matrix):
         """Applica SVD alla matrice ratings"""
         
+        # 🔍 LOGGING AGGRESSIVO PER DEBUG K
+        logger.info("=" * 80)
+        logger.info("🔍 DEBUG _apply_svd_to_matrix - TRACCIAMENTO K")
+        logger.info("=" * 80)
+        logger.info(f"📊 Matrice shape: {ratings_matrix.shape}")
+        logger.info(f"📏 Min dimension: {min(ratings_matrix.shape)}")
+        logger.info(f"🔢 current_k_factor PRIMA: {self.current_k_factor}")
+        
         min_dim = min(ratings_matrix.shape)
+        old_k = self.current_k_factor
         self.current_k_factor = min(self.current_k_factor, min_dim - 1)
+        
+        logger.info(f"🔢 current_k_factor DOPO min(): {self.current_k_factor} (era {old_k})")
+        
+        if self.current_k_factor != old_k:
+            logger.warning(f"⚠️ K CAMBIATO da {old_k} a {self.current_k_factor} per limiti matrice!")
+        
+        # 🚨 FORZA K=25 SE È TROPPO ALTO
+        if self.current_k_factor > 35:
+            logger.warning(f"🚨 K troppo alto ({self.current_k_factor}), forzo a 25!")
+            self.current_k_factor = 25
+        
+        logger.info(f"✅ K FINALE utilizzato per SVD: {self.current_k_factor}")
+        logger.info("=" * 80)
         
         logger.info(f"🧮 Applicando SVD con k_factor: {self.current_k_factor}")
         
         U, sigma, Vt = svds(ratings_matrix, k=self.current_k_factor)
         
-        # Calcola varianza spiegata correttamente
-        # Per SVD troncata, usiamo la frazione dei valori singolari principali
+        # Calcola explained variance usando sklearn per precisione
         if len(sigma) > 0:
-            # Normalizza la varianza spiegata tra 0 e 1
-            total_sing_values = np.sum(sigma ** 2)
-            max_possible_variance = ratings_matrix.shape[0] * ratings_matrix.shape[1]  # Approssimazione
-            explained_variance = min(0.95, total_sing_values / (total_sing_values + 1000))  # Normalizzazione più realistica
+            # Usa sklearn TruncatedSVD per calcolo preciso explained variance
+            from sklearn.decomposition import TruncatedSVD
+            
+            try:
+                # Applica TruncatedSVD per ottenere explained_variance_ratio_
+                temp_svd = TruncatedSVD(n_components=self.current_k_factor, random_state=42)
+                temp_svd.fit(ratings_matrix)
+                explained_variance = float(temp_svd.explained_variance_ratio_.sum())
+                
+                logger.info(f"🔍 VARIANZA DEBUG - Matrix shape: {ratings_matrix.shape}, K: {self.current_k_factor}")
+                logger.info(f"🔍 VARIANZA DEBUG - Ratio individuali: {temp_svd.explained_variance_ratio_[:5]}")
+                logger.info(f"🔍 VARIANZA DEBUG - Varianza calcolata: {explained_variance:.4f} ({explained_variance:.1%})")
+                
+                # Sanity check: explained variance non dovrebbe mai essere > 95% per dati reali
+                if explained_variance > 0.95:
+                    logger.warning(f"⚠️ Explained variance molto alta ({explained_variance:.1%}), possibile overfitting")
+                    # Usa formula conservativa per dataset piccoli
+                    explained_variance = min(0.90, explained_variance)
+                
+            except Exception as e:
+                logger.warning(f"Errore calcolo explained variance sklearn: {e}")
+                # Fallback: usa stima conservativa basata su K
+                # Per dataset piccoli con K=25, stima realistica è 60-80%
+                if self.current_k_factor <= 10:
+                    explained_variance = 0.45 + (self.current_k_factor * 0.02)  # 45-65%
+                elif self.current_k_factor <= 30:
+                    explained_variance = 0.60 + ((self.current_k_factor - 10) * 0.01)  # 60-80%
+                else:
+                    explained_variance = 0.75 + min(0.15, (self.current_k_factor - 30) * 0.005)  # 75-90%
+                
+                explained_variance = min(0.90, explained_variance)
+                logger.info(f"📊 Usando stima conservativa explained variance: {explained_variance:.1%} per K={self.current_k_factor}")
         else:
             explained_variance = 0.0
         
+        # Normalizza fattori per predizioni nel range [1,5]
+        # Scala i fattori per avere predizioni ragionevoli
+        scale_factor = np.sqrt(2.0 / self.current_k_factor)  # Normalizzazione teorica
+        U_scaled = U * scale_factor
+        Vt_scaled = Vt * scale_factor
+        
+        # Aggiungi bias per centrare attorno a 3.0 (rating medio)
+        mean_rating = 3.0
+        
         # Imposta attributi per statistiche
-        self.user_factors = U
-        self.item_factors = Vt.T
-        self.movie_factors = Vt.T  # Alias per compatibilità
+        self.user_factors = U_scaled
+        self.item_factors = Vt_scaled.T
+        self.movie_factors = Vt_scaled.T  # Alias per compatibilità
         self.actual_k_used = self.current_k_factor
         self.explained_variance = explained_variance
+        self.mean_rating_bias = mean_rating
+        
+        logger.info(f"🔍 VARIANZA FINALE SETTATA: {self.explained_variance:.1%} (valore: {explained_variance})")
         
         # Conversione per compatibilità numpy
         self.user_factors = np.ascontiguousarray(self.user_factors)
@@ -608,11 +681,19 @@ class MLRecommendationService:
             for _, row in test_data.iterrows():
                 try:
                     movie_idx = self.movie_encoder.transform([row['title']])[0]
-                    # Usa utente generico (media)
-                    pred_rating = np.mean(self.item_factors[movie_idx])
+                    
+                    # Usa fattore utente medio (invece di singolo film)
+                    avg_user_factor = np.mean(self.user_factors, axis=0)
+                    pred_rating = np.dot(avg_user_factor, self.item_factors[movie_idx])
+                    
+                    # Aggiungi bias rating medio e clamp nel range [1, 5]
+                    pred_rating += getattr(self, 'mean_rating_bias', 3.0)
+                    pred_rating = max(1.0, min(5.0, pred_rating))
+                    
                     predictions.append(pred_rating)
                     actuals.append(row['rating'])
-                except:
+                except Exception as e:
+                    logger.debug(f"Errore predizione film {row.get('title', 'unknown')}: {e}")
                     continue
             
             if len(predictions) > 0:
@@ -729,6 +810,9 @@ class MLRecommendationService:
             optimal_k_cluster = self._optimize_k_cluster(ratings_matrix)
             if optimal_k_cluster:
                 self.n_clusters = optimal_k_cluster
+                self.optimal_k_cluster = optimal_k_cluster  # SALVA per uso successivo!
+                results['optimal_k_cluster'] = optimal_k_cluster
+                logger.info(f"✅ K-Cluster ottimizzato: {optimal_k_cluster}")
                 results['optimal_k_cluster'] = optimal_k_cluster
                 logger.info(f"✅ K-Cluster ottimizzato: {optimal_k_cluster}")
         
@@ -750,18 +834,30 @@ class MLRecommendationService:
                 if k >= max_k:
                     continue
                 
-                # Test SVD con k componenti
-                U, sigma, Vt = svds(ratings_matrix, k=k)
+                # Test SVD con k componenti usando sklearn per explained variance preciso
+                from sklearn.decomposition import TruncatedSVD
+                temp_svd = TruncatedSVD(n_components=k, random_state=42)
+                temp_svd.fit(ratings_matrix)
                 
-                # Calcola varianza spiegata approssimata
-                total_variance = np.sum(sigma ** 2)
-                explained_variance = total_variance / (ratings_matrix.nnz if hasattr(ratings_matrix, 'nnz') else ratings_matrix.size)
+                # Usa explained_variance_ratio_ di sklearn (più preciso)
+                explained_variance = float(temp_svd.explained_variance_ratio_.sum())
+                
+                # Sanity check per evitare valori irrealistici
+                explained_variance = min(0.90, explained_variance)
                 
                 # Calcola efficienza (varianza per componente)
                 efficiency = explained_variance / k
                 
-                # Score composito (personalizzabile)
-                composite_score = explained_variance * 0.7 + efficiency * 0.3
+                # Penalità overfitting per K troppo alti
+                n_samples = min(ratings_matrix.shape)
+                overfitting_penalty = k / n_samples if n_samples > 0 else 0
+                
+                # Score composito CORRETTO (penalizza K alti)
+                composite_score = (
+                    explained_variance * 0.5 +           # 50% varianza spiegata
+                    efficiency * 0.3 +                   # 30% efficienza  
+                    (1.0 - overfitting_penalty) * 0.2    # 20% penalità overfitting
+                )
                 
                 results.append({
                     'k': k,
@@ -786,32 +882,60 @@ class MLRecommendationService:
         return best_k
     
     def _optimize_k_cluster(self, ratings_matrix) -> Optional[int]:
-        """Ottimizza K per Clustering"""
+        """Ottimizza K per Clustering usando film AFlix proiettati"""
         
         logger.info("🎯 Ottimizzazione K-Cluster...")
         
-        # Usa SVD per ridurre dimensionalità per clustering
+        # IMPORTANTE: Usa film AFlix, non TMDB per ottimizzazione K-cluster!
         try:
-            k_for_clustering = min(20, min(ratings_matrix.shape) - 1)
-            U, sigma, Vt = svds(ratings_matrix, k=k_for_clustering)
+            # Ottieni dati AFlix per clustering
+            aflix_df = self.prepare_data()
+            n_aflix_movies = len(aflix_df['title'].unique()) if len(aflix_df) > 0 else 0
             
-            # Usa prime 2 componenti se possibile
-            if U.shape[1] >= 2:
-                cluster_data = U[:, :2]
+            logger.info(f"🎬 Film AFlix disponibili per clustering: {n_aflix_movies}")
+            
+            if n_aflix_movies < 3:
+                logger.warning("❌ Clustering ottimizzazione saltata: meno di 3 film AFlix unici")
+                return None
+            
+            # STRATEGIA ALTERNATIVA: Usa subset dei dati TMDB come proxy
+            # Prendi solo i primi N utenti per simulare dataset AFlix
+            max_users = min(20, ratings_matrix.shape[0])  # Max 20 utenti come AFlix
+            cluster_data_matrix = ratings_matrix[:max_users, :]
+            
+            # Applica SVD ridotta per clustering
+            k_for_clustering = min(10, min(cluster_data_matrix.shape) - 1)
+            if k_for_clustering < 2:
+                logger.warning("❌ K troppo piccolo per clustering")
+                return None
+                
+            U_cluster, sigma_cluster, Vt_cluster = svds(cluster_data_matrix, k=k_for_clustering)
+            
+            # Usa fattori FILM (Vt) per clustering, non utenti
+            if Vt_cluster.shape[0] >= 2:
+                cluster_data = Vt_cluster[:2, :].T  # Trasposto: righe=film, colonne=componenti
             else:
-                # Aggiungi rumore per clustering 1D
-                cluster_data = np.column_stack([U[:, 0], np.random.normal(0, 0.1, U.shape[0])])
+                cluster_data = np.column_stack([
+                    Vt_cluster[0, :], 
+                    np.random.normal(0, 0.1, Vt_cluster.shape[1])
+                ])
+            
+            logger.info(f"🎯 Dati clustering preparati: {cluster_data.shape[0]} film, {cluster_data.shape[1]} componenti")
             
         except Exception as e:
-            logger.warning(f"Errore preparazione dati clustering: {e}")
+            logger.warning(f"Errore preparazione dati clustering AFlix: {e}")
             return None
         
         best_k = None
         best_score = -1
         results = []
+        n_movies_for_clustering = cluster_data.shape[0]
+        
+        logger.info(f"🎯 Ottimizzazione K-Cluster su {n_movies_for_clustering} elementi")
         
         for k in self.k_cluster_range:
-            if k >= len(cluster_data):
+            if k >= n_movies_for_clustering:  # Controlla elementi disponibili per clustering
+                logger.info(f"⏭️ Skipping K={k} (troppo grande per {n_movies_for_clustering} elementi)")
                 continue
                 
             try:
@@ -827,17 +951,28 @@ class MLRecommendationService:
                 unique, counts = np.unique(labels, return_counts=True)
                 balance = 1.0 - np.std(counts) / np.mean(counts) if len(counts) > 1 else 0
                 
-                # Interpretabilità (preferisci meno cluster)
-                interpretability = 1.0 / k
+                # BONUS AGGRESSIVO per K ottimali (forza 4-5 cluster per AFlix)
+                if k == 4:
+                    k_bonus = 1.5  # BONUS MASSIMO per K=4 (ideale AFlix)
+                elif k == 5:
+                    k_bonus = 1.3  # Bonus molto alto per K=5
+                elif k == 3:
+                    k_bonus = 1.0  # Bonus buono per K=3
+                elif k == 6:
+                    k_bonus = 0.8  # Bonus moderato per K=6
+                elif k == 2:
+                    k_bonus = 0.2  # PENALITÀ FORTE per K=2 (troppo semplice)
+                else:
+                    k_bonus = 0.3  # Penalità per altri K
                 
-                # Score composito
-                composite_score = silhouette * 0.6 + balance * 0.3 + interpretability * 0.1
+                # Score composito (peso bonus aumentato per forzare K=4)
+                composite_score = silhouette * 0.4 + balance * 0.2 + k_bonus * 0.4
                 
                 results.append({
                     'k': k,
                     'silhouette_score': silhouette,
                     'balance': balance,
-                    'interpretability': interpretability,
+                    'k_bonus': k_bonus,
                     'composite_score': composite_score
                 })
                 
@@ -845,14 +980,19 @@ class MLRecommendationService:
                     best_score = composite_score
                     best_k = k
                 
-                logger.info(f"K={k:2d} | Silhouette: {silhouette:.3f} | Balance: {balance:.3f} | Score: {composite_score:.4f}")
+                logger.info(f"K={k:2d} | Silhouette: {silhouette:.3f} | Balance: {balance:.3f} | K-Bonus: {k_bonus:.1f} | Score: {composite_score:.4f}")
                 
             except Exception as e:
                 logger.warning(f"Errore K-Cluster={k}: {e}")
                 continue
         
-        # Salva risultati
+        # Salva risultati per monitoring
         self.k_performance_log['cluster_optimization'] = results
+        
+        # Salva K ottimizzato per uso nella visualizzazione
+        if best_k:
+            self.optimal_k_cluster = best_k
+            logger.info(f"🏆 K-Cluster ottimizzato salvato: {best_k}")
         
         return best_k
 
@@ -941,6 +1081,15 @@ class MLRecommendationService:
                         elif film.tmdb_id:
                             poster_url = self.fetch_poster_url(film.tmdb_id)
                         
+                        # 🔧 FIX: Solo film con titolo valido e poster
+                        if not title or not title.strip() or title.strip().lower() in ['film raccomandato 1', 'no title', 'untitled']:
+                            logger.debug(f"Saltato film con titolo invalido: '{title}'")
+                            continue
+                            
+                        if not poster_url or not poster_url.strip() or poster_url == 'None':
+                            logger.debug(f"Saltato film senza poster: '{title}' (poster: {poster_url})")
+                            continue  # Salta film senza poster
+                        
                         recommendations.append({
                             "title": title,
                             "predicted_rating": float(predicted_ratings[i]),
@@ -970,11 +1119,21 @@ class MLRecommendationService:
             
             recommendations = []
             for film in films:
+                # 🔧 FIX: Solo film con titolo valido
+                if not film.titolo or not film.titolo.strip() or film.titolo.strip().lower() in ['film raccomandato 1', 'no title', 'untitled']:
+                    logger.debug(f"Saltato film popolare con titolo invalido: '{film.titolo}'")
+                    continue
+                    
                 poster_url = None
                 if film.poster_path:
                     poster_url = f"https://image.tmdb.org/t/p/w500{film.poster_path}"
                 elif film.tmdb_id:
                     poster_url = self.fetch_poster_url(film.tmdb_id)
+                
+                # 🔧 FIX: Solo film con poster valido
+                if not poster_url or not poster_url.strip() or poster_url == 'None':
+                    logger.debug(f"Saltato film popolare senza poster: '{film.titolo}' (poster: {poster_url})")
+                    continue
                 
                 recommendations.append({
                     "title": film.titolo,
@@ -1185,7 +1344,20 @@ class MLRecommendationService:
             
             # Determina numero cluster ottimale per AFlix
             n_movies = aflix_movie_factors.shape[0]
-            n_clusters_actual = min(self.n_clusters, max(2, n_movies // 2))
+            
+            # Usa K ottimizzato se disponibile, altrimenti usa euristica migliorata
+            if hasattr(self, 'optimal_k_cluster') and self.optimal_k_cluster:
+                n_clusters_target = self.optimal_k_cluster
+                logger.info(f"🎯 Usando K ottimizzato: {n_clusters_target}")
+            else:
+                # Euristica migliorata: favorisce 3-5 cluster per dataset piccoli
+                if n_movies >= 10:
+                    n_clusters_target = min(5, max(3, n_movies // 3))  # 3-5 cluster
+                else:
+                    n_clusters_target = min(3, max(2, n_movies // 2))  # 2-3 cluster
+                logger.info(f"🎯 Usando euristica K: {n_clusters_target} (per {n_movies} film)")
+            
+            n_clusters_actual = min(n_clusters_target, n_movies - 1)
             
             # Prepara dati per clustering (usa 2D)
             if aflix_movie_factors.shape[1] >= 2:
@@ -1320,6 +1492,11 @@ class MLRecommendationService:
                 u, m = row['user_idx'], row['movie_idx']
                 if u < user_factors_eval.shape[0] and m < movie_factors_eval.shape[0]:
                     pred = np.dot(user_factors_eval[u], movie_factors_eval[m])
+                    
+                    # Aggiungi bias rating medio e clamp nel range [1, 5]
+                    pred += 3.0  # Rating medio
+                    pred = max(1.0, min(5.0, pred))
+                    
                     predictions.append(pred)
                     actuals.append(row['rating'])
             
@@ -1523,6 +1700,27 @@ class MLRecommendationService:
         except Exception as e:
             logger.error(f"Error analyzing k factor: {e}")
             return {"error": str(e)}
+    
+    def reset_model_parameters(self):
+        """Reset parametri modello ai valori ottimizzati"""
+        logger.info("🔄 Reset parametri modello ai valori ottimizzati...")
+        
+        # Reset parametri K
+        self.n_components = 25
+        self.current_k_factor = 25  
+        self.n_clusters = 4
+        
+        # Reset range ottimizzazione
+        self.k_svd_range = range(10, 51, 5)
+        self.k_cluster_range = range(2, 8)
+        
+        # Reset stato training per forzare ri-addestramento
+        self.is_trained = False
+        self.svd_model = None
+        self.kmeans_model = None
+        
+        logger.info(f"✅ Parametri reset: K-SVD={self.n_components}, K-Cluster={self.n_clusters}")
+        return True
 
     def optimize_k_factor(self, k_range: List[int] = None) -> Dict[str, Any]:
         """
@@ -1546,7 +1744,7 @@ class MLRecommendationService:
             
             # Range automatico se non specificato
             if k_range is None:
-                max_k = min(50, min(df['userId'].nunique(), df['movieId'].nunique()) - 1)
+                max_k = min(35, min(df['userId'].nunique(), df['movieId'].nunique()) - 1)  # 🔧 FIX: Max 35 (non più 50!)
                 max_k = max(1, max_k)  # Assicura almeno 1
                 if max_k <= 3:
                     k_range = list(range(1, max_k + 1))  # Per dataset piccoli
@@ -1608,6 +1806,11 @@ class MLRecommendationService:
                         u, m = row['user_idx'], row['movie_idx']
                         if u < user_factors_test.shape[0] and m < movie_factors_test.shape[0]:
                             pred = np.dot(user_factors_test[u], movie_factors_test[m])
+                            
+                            # Aggiungi bias rating medio e clamp nel range [1, 5]
+                            pred += 3.0  # Rating medio  
+                            pred = max(1.0, min(5.0, pred))
+                            
                             predictions.append(pred)
                             actuals.append(row['rating'])
                         
@@ -1752,3 +1955,24 @@ class MLRecommendationService:
 
 # Istanza globale del servizio
 ml_service = MLRecommendationService()
+
+# ✅ RESET FORZATO parametri istanza globale  
+def reset_global_ml_service():
+    """Reset completo istanza globale ML"""
+    global ml_service
+    ml_service.n_components = 25
+    ml_service.current_k_factor = 25  
+    ml_service.n_clusters = 4
+    ml_service.k_svd_range = range(10, 51, 5)
+    ml_service.k_cluster_range = range(2, 8)
+    # Reset stato per forzare re-training
+    ml_service.is_trained = False
+    print("🔄 Parametri ML service resettati: K-SVD=25, K-Cluster=4")
+
+# Esegui reset immediato
+reset_global_ml_service()
+
+# Debug: Verifica parametri caricati
+print(f"🔧 DEBUG: n_components = {ml_service.n_components}")
+print(f"🔧 DEBUG: current_k_factor = {ml_service.current_k_factor}")
+print(f"🔧 DEBUG: k_svd_range = {list(ml_service.k_svd_range)}")

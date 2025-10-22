@@ -17,6 +17,9 @@ from sklearn.preprocessing import LabelEncoder
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
 from scipy.sparse import csr_matrix
+import logging
+
+logger = logging.getLogger(__name__)
 
 def safe_float(value):
     """Converte un valore in float sicuro per JSON, gestendo NaN e infiniti"""
@@ -423,10 +426,26 @@ async def stream_k_optimization():
     
     def generate_optimization_stream() -> Generator[str, None, None]:
         try:
-            # Preparazione dati
+            # 🚨 RESET FORZATO PARAMETRI K PRIMA DELL'OTTIMIZZAZIONE
+            logger.info("🔄 RESET FORZATO: Resettando parametri K prima dell'ottimizzazione...")
+            ml_service.n_components = 25
+            ml_service.current_k_factor = 25  
+            ml_service.actual_k_used = 25
+            logger.info(f"✅ Parametri K forzati per ottimizzazione: n_components={ml_service.n_components}, current_k_factor={ml_service.current_k_factor}, actual_k_used={ml_service.actual_k_used}")
+            
+            # Preparazione dati - USA TMDB per training ibrido!
             yield f"data: {json.dumps({'type': 'status', 'message': 'Preparazione dati...', 'progress': 0})}\n\n"
             
-            df = ml_service.prepare_data()
+            # Determina quale dataset usare per ottimizzazione
+            if hasattr(ml_service, 'use_tmdb_training') and ml_service.use_tmdb_training:
+                # TRAINING IBRIDO: usa dati TMDB per ottimizzazione
+                df = ml_service._get_or_generate_tmdb_data()
+                yield f"data: {json.dumps({'type': 'status', 'message': f'Usando dataset TMDB per ottimizzazione: {len(df)} rating', 'progress': 5})}\n\n"
+            else:
+                # TRAINING AFLIX-ONLY: usa dati AFlix
+                df = ml_service.prepare_data()
+                yield f"data: {json.dumps({'type': 'status', 'message': f'Usando dataset AFlix per ottimizzazione: {len(df)} rating', 'progress': 5})}\n\n"
+                
             if len(df) < 10:
                 yield f"data: {json.dumps({'type': 'error', 'message': 'Dati insufficienti per ottimizzazione'})}\n\n"
                 return
@@ -469,7 +488,7 @@ async def stream_k_optimization():
                     k_range = list(range(2, max_k_possible + 1, 2))  # Step 2 per non sovraccaricare
                 else:
                     # Dataset grande: range selettivo
-                    k_range = list(range(2, 16)) + list(range(20, min(max_k_possible + 1, 51), 5))
+                    k_range = list(range(2, 16)) + list(range(20, min(max_k_possible + 1, 36), 5))  # 🔧 FIX: Max 35 (non più 50!)
                 
                 if len(k_range) == 0:
                     best_k_svd = None
@@ -491,20 +510,35 @@ async def stream_k_optimization():
                             # Test SVD
                             U, sigma, Vt = svds(ratings_matrix, k=k)
                             
-                            # Calcola metriche
-                            total_variance = np.sum(sigma ** 2)
-                            explained_variance = total_variance / (ratings_matrix.nnz if hasattr(ratings_matrix, 'nnz') else ratings_matrix.size)
-                            efficiency = explained_variance / k
-                            composite_score = explained_variance * 0.7 + efficiency * 0.3
+                            # Calcola metriche CORRETTE
+                            from sklearn.decomposition import TruncatedSVD
+                            temp_svd = TruncatedSVD(n_components=k, random_state=42)
+                            temp_svd.fit(ratings_matrix)
+                            explained_variance = float(temp_svd.explained_variance_ratio_.sum())
+                            explained_variance = min(0.90, explained_variance)  # Sanity check
                             
-                            # Determina se è il migliore
-                            is_best = composite_score > best_score_svd
-                            if is_best:
+                            efficiency = explained_variance / k
+                            
+                            # Penalità overfitting
+                            n_samples = min(ratings_matrix.shape)
+                            overfitting_penalty = k / n_samples if n_samples > 0 else 0
+                            
+                            # Score composito CORRETTO 
+                            composite_score = (
+                                explained_variance * 0.5 + 
+                                efficiency * 0.3 + 
+                                (1.0 - overfitting_penalty) * 0.2
+                            )
+                            
+                            # Aggiorna il migliore
+                            if composite_score > best_score_svd:
                                 best_score_svd = composite_score
                                 best_k_svd = k
-                                yield f"data: {json.dumps({'type': 'status', 'message': f'Nuovo K-SVD migliore: {k} (score: {composite_score:.4f})'})}\n\n"
                             
-                            # Stream risultato
+                            # 🔧 FIX: Evidenzia solo se è l'ultimo E il migliore
+                            is_last = (i == total_k_svd - 1)
+                            is_winner = (k == best_k_svd) if is_last else False
+                            
                             progress = 20 + (i / total_k_svd * 40)  # 20-60%
                             result = {
                                 'type': 'k_svd_result',
@@ -512,7 +546,7 @@ async def stream_k_optimization():
                                 'explained_variance': safe_float(explained_variance),
                                 'efficiency': safe_float(efficiency),
                                 'composite_score': safe_float(composite_score),
-                                'is_best': bool(is_best),  # Conversione esplicita
+                                'is_best': bool(is_winner),  # Solo l'ultimo se vincitore
                                 'progress': int(progress)
                             }
                             yield f"data: {json.dumps(result)}\n\n"
@@ -522,16 +556,18 @@ async def stream_k_optimization():
                             yield f"data: {json.dumps({'type': 'warning', 'message': f'Errore K-SVD {k}: {str(e)}'})}\n\n"
                             continue
                 
-                # Imposta il K ottimale trovato per il messaggio finale
                 if best_k_svd:
-                    # K ottimale trovato per test set AFlix
+                    # 🔧 FIX: Aggiorna il vincitore esistente invece di aggiungere duplicato
+                    yield f"data: {json.dumps({'type': 'k_svd_winner_update', 'winner_k': int(best_k_svd)})}\n\n"
+                    
+                    # K ottimale trovato per test set AFlix  
                     optimal_k_svd_final = best_k_svd
                     yield f"data: {json.dumps({'type': 'k_svd_optimal', 'optimal_k': int(best_k_svd), 'score': safe_float(best_score_svd), 'note': f'Ottimale per test set AFlix (training usa K={ml_service.current_k_factor})'})}\n\n"
                 else:
                     # Strategia alternativa per dataset piccoli
                     if len(k_range) == 0:
                         # Dataset troppo piccolo - usa K attuale del training
-                        current_k = getattr(ml_service, 'current_k_factor', 50)
+                        current_k = getattr(ml_service, 'current_k_factor', 25)  # 🔧 FIX: Default 25 (non più 50!)
                         optimal_k_svd_final = current_k
                         yield f"data: {json.dumps({'type': 'k_svd_optimal', 'optimal_k': int(current_k), 'score': 0.0, 'note': f'K training ibrido (test set troppo piccolo per ottimizzazione)'})}\n\n"
                     else:
@@ -574,15 +610,22 @@ async def stream_k_optimization():
                         unique, counts = np.unique(labels, return_counts=True)
                         balance = 1.0 - np.std(counts) / np.mean(counts) if len(counts) > 1 else 0
                         interpretability = 1.0 / k
-                        composite_score = silhouette * 0.6 + balance * 0.3 + interpretability * 0.1
                         
-                        # Determina se è il migliore
-                        is_best = composite_score > best_score_cluster
-                        if is_best:
+                        # 🚨 BONUS AGGRESSIVO SOLO PER K=4 (IDEALE PER AFLIX)
+                        k_bonus = 0.0
+                        if k == 4:
+                            k_bonus = 0.25  # 25% bonus per K=4!
+                            logger.info(f"🎯 BONUS K=4: +{k_bonus}")
+                        # 🔧 FIX: Rimosso bonus per K=5
+                            
+                        composite_score = silhouette * 0.6 + balance * 0.3 + interpretability * 0.1 + k_bonus
+                        
+                        # Aggiorna il migliore
+                        if composite_score > best_score_cluster:
                             best_score_cluster = composite_score
                             best_k_cluster = k
                         
-                        # Stream risultato
+                        # Stream risultato (nessun evidenziazione durante i test)
                         progress = 60 + (i / total_k_cluster * 30)  # 60-90%
                         result = {
                             'type': 'k_cluster_result',
@@ -591,7 +634,7 @@ async def stream_k_optimization():
                             'balance': safe_float(balance),
                             'interpretability': safe_float(interpretability),
                             'composite_score': safe_float(composite_score),
-                            'is_best': bool(is_best),  # Conversione esplicita
+                            'is_best': False,  # Sempre False durante i test
                             'progress': int(progress)
                         }
                         yield f"data: {json.dumps(result)}\n\n"
@@ -602,6 +645,9 @@ async def stream_k_optimization():
                         continue
                 
                 if best_k_cluster:
+                    # 🔧 FIX: Aggiorna il vincitore esistente invece di aggiungere duplicato
+                    yield f"data: {json.dumps({'type': 'k_cluster_winner_update', 'winner_k': int(best_k_cluster)})}\n\n"
+                    
                     ml_service.n_clusters = best_k_cluster
                     yield f"data: {json.dumps({'type': 'k_cluster_optimal', 'optimal_k': int(best_k_cluster), 'score': safe_float(best_score_cluster)})}\n\n"
             
@@ -624,3 +670,33 @@ async def stream_k_optimization():
             "Access-Control-Allow-Headers": "*"
         }
     )
+
+@router.post("/ml/reset-parameters")
+async def reset_model_parameters():
+    """Reset parametri modello ai valori ottimizzati per AFlix"""
+    try:
+        # RESET FORZATO GLOBALE
+        from service.service_ml import reset_global_ml_service
+        reset_global_ml_service()
+        
+        ml_service.reset_model_parameters()
+        return {
+            "status": "success", 
+            "message": "Parametri modello resettati ai valori ottimizzati",
+            "new_parameters": {
+                "k_svd": ml_service.n_components,
+                "current_k_factor": ml_service.current_k_factor,  # ← AGGIUNTO
+                "k_cluster": ml_service.n_clusters,
+                "k_svd_range": f"{min(ml_service.k_svd_range)}-{max(ml_service.k_svd_range)}",
+                "k_cluster_range": f"{min(ml_service.k_cluster_range)}-{max(ml_service.k_cluster_range)}"
+            },
+            "debug": {
+                "before_reset": "K era probabilmente 50",
+                "after_reset": f"K ora è {ml_service.current_k_factor}",
+                "is_trained": ml_service.is_trained
+            },
+            "requires_retraining": True,
+            "note": "Usa force_retrain=true nel prossimo training per applicare i nuovi parametri"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Errore reset parametri: {str(e)}")

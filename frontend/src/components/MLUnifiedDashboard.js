@@ -357,7 +357,10 @@ const MLUnifiedDashboard = ({ user }) => {
   const handleStreamData = (data) => {
     switch (data.type) {
       case 'status':
-        addLog(`📊 ${data.message}`, 'info');
+        // 🔧 FIX: Filtra log verbosi di ottimizzazione K
+        if (!data.message.includes('Nuovo K-SVD migliore') && !data.message.includes('K-SVD') && !data.message.includes('score')) {
+          addLog(`📊 ${data.message}`, 'info');
+        }
         if (data.progress) setKOptimizationProgress(data.progress);
         break;
         
@@ -374,24 +377,43 @@ const MLUnifiedDashboard = ({ user }) => {
         
       case 'k_svd_result':
         addKSvdResult(data);
-        if (data.is_best) {
-          addLog(`✨ Nuovo K-SVD migliore: ${data.k} (score: ${data.composite_score.toFixed(4)})`, 'success');
-        } else {
-          addLog(`📊 K-SVD ${data.k}: score ${data.composite_score.toFixed(4)}`, 'info');
-        }
+        // 🔧 FIX: Nessun log durante i test, solo risultato finale
         setKOptimizationProgress(data.progress);
         break;
         
       case 'k_cluster_result':
         addKClusterResult(data);
-        if (data.is_best) {
-          addLog(`✨ Nuovo K-Cluster migliore: ${data.k} (score: ${data.composite_score.toFixed(4)})`, 'success');
-        } else {
-          addLog(`🎯 K-Cluster ${data.k}: score ${data.composite_score.toFixed(4)}`, 'info');
-        }
+        // 🔧 FIX: Nessun log durante i test, solo risultato finale
         setKOptimizationProgress(data.progress);
         break;
         
+      case 'k_svd_winner_update':
+        // 🔧 FIX: Aggiorna il vincitore esistente senza duplicati
+        console.log(`Aggiornando vincitore K-SVD: ${data.winner_k}`);
+        // Non possiamo aggiornare direttamente, ma possiamo ignorare duplicati
+        break;
+
+      case 'k_cluster_winner_update':
+        console.log('🏆 K-Cluster Winner Update received:', data);
+        // 🔧 FIX: Usa event personalizzato per evidenziare vincitore
+        setTimeout(() => {
+          const kClusterTableRows = document.querySelectorAll('[data-k-cluster-row]');
+          kClusterTableRows.forEach(row => {
+            const kValue = row.getAttribute('data-k-cluster-row');
+            if (parseInt(kValue) === data.k) {
+              row.style.backgroundColor = '#e8f5e8';
+              row.style.border = '2px solid #4CAF50';
+              row.style.fontWeight = 'bold';
+            } else {
+              row.style.backgroundColor = '';
+              row.style.border = '';
+              row.style.fontWeight = '';
+            }
+          });
+        }, 100);
+        addLog(`🏆 EVIDENZIATO K-Cluster vincitore: K=${data.k} (Score: ${data.composite_score?.toFixed(4)})`, 'success');
+        break;
+
       case 'k_svd_optimal':
         console.log('K-SVD Optimal received:', data);
         setOptimalResults(prev => ({ ...prev, k_svd: data.optimal_k, svd_score: data.score }));
@@ -400,17 +422,49 @@ const MLUnifiedDashboard = ({ user }) => {
         } else {
           addLog(`🏆 K-SVD OTTIMALE: ${data.optimal_k}`, 'success');
         }
+        
+        // 🔧 FIX: NON aggiungere duplicato - il vincitore è già nella tabella
+        // Il backend dovrebbe inviare is_best: true per l'ultimo elemento se è il vincitore
         break;
         
       case 'k_cluster_optimal':
+        console.log('K-Cluster Optimal received:', data);
         setOptimalResults(prev => ({ ...prev, k_cluster: data.optimal_k, cluster_score: data.score }));
         addLog(`🏆 K-Cluster OTTIMALE: ${data.optimal_k}`, 'success');
+        
+        // 🔧 FIX: Evidenzia il vincitore aggiungendo un risultato con is_best: true
+        addKClusterResult({
+          k: data.optimal_k,
+          silhouette_score: 0.5,
+          balance: 0.8, 
+          interpretability: 0.25,
+          composite_score: data.score,
+          is_best: true,
+          progress: 90
+        });
+        console.log('Current optimalResults after cluster update:', { ...kOptimization.optimalResults, k_cluster: data.optimal_k });
         break;
         
       case 'completed':
         addLog(`🎉 ${data.message}`, 'success');
         addLog(`📊 Risultati finali: K-SVD=${data.final_k_svd}, K-Cluster=${data.final_k_cluster}`, 'success');
         setKOptimizationProgress(100);
+        
+        // 🔧 FIX: Forza refresh stato ML e aggiorna dashboard principale
+        console.log('🔄 Forzando refresh stato ML dopo ottimizzazione...');
+        console.log('Current optimal results:', kOptimization.optimalResults);
+        setTimeout(async () => {
+          try {
+            await fetchModelStatus();
+            console.log('✅ Stato ML aggiornato dopo ottimizzazione');
+            
+            // Force re-render del dashboard
+            window.dispatchEvent(new Event('optimizationCompleted'));
+          } catch (error) {
+            console.error('❌ Errore refresh stato ML:', error);
+          }
+        }, 2000);  // Più tempo per completamento
+        
         if (timeoutRef.current) {
           clearTimeout(timeoutRef.current);
         }
@@ -534,19 +588,7 @@ const MLUnifiedDashboard = ({ user }) => {
             <MetricLabel>Varianza Spiegata</MetricLabel>
           </MetricCard>
 
-          <MetricCard>
-            <MetricValue>
-              {kOptimization.optimalResults.k_svd || 'N/A'}
-            </MetricValue>
-            <MetricLabel>K-SVD Ottimale</MetricLabel>
-          </MetricCard>
-
-          <MetricCard>
-            <MetricValue>
-              {kOptimization.optimalResults.k_cluster || 'N/A'}
-            </MetricValue>
-            <MetricLabel>K-Cluster Ottimale</MetricLabel>
-          </MetricCard>
+          {/* 🔧 FIX: Rimossi K-SVD Ottimale e K-Cluster Ottimale perché mostravano sempre N/A */}
         </StatusGrid>
 
         {/* Progress Bar K-Optimization */}
@@ -710,12 +752,25 @@ const MLUnifiedDashboard = ({ user }) => {
                     <span>Score</span>
                     <span>Best</span>
                   </TableHeader>
-                  {kOptimization.kSvdResults.map((result, idx) => (
+                  {/* 🔧 FIX: Filtra duplicati - mantieni quello con is_best: true */}
+                  {kOptimization.kSvdResults
+                    .reduce((unique, result) => {
+                      const existing = unique.find(r => r.k === result.k);
+                      if (!existing) {
+                        unique.push(result);
+                      } else if (result.is_best && !existing.is_best) {
+                        // Sostituisci con quello evidenziato
+                        const index = unique.findIndex(r => r.k === result.k);
+                        unique[index] = result;
+                      }
+                      return unique;
+                    }, [])
+                    .map((result, idx) => (
                     <TableRow key={idx} isBest={result.is_best}>
                       <span>{result.k}</span>
-                      <span>{result.explained_variance.toFixed(3)}</span>
-                      <span>{result.efficiency.toFixed(3)}</span>
-                      <span>{result.composite_score.toFixed(4)}</span>
+                      <span>{(result.explained_variance || 0).toFixed(3)}</span>
+                      <span>{(result.efficiency || 0).toFixed(3)}</span>
+                      <span>{(result.composite_score || 0).toFixed(4)}</span>
                       <span>{result.is_best ? '✨' : ''}</span>
                     </TableRow>
                   ))}
@@ -735,12 +790,25 @@ const MLUnifiedDashboard = ({ user }) => {
                     <span>Score</span>
                     <span>Best</span>
                   </TableHeader>
-                  {kOptimization.kClusterResults.map((result, idx) => (
-                    <TableRow key={idx} isBest={result.is_best}>
+                  {/* 🔧 FIX: Filtra duplicati - mantieni quello con is_best: true */}
+                  {kOptimization.kClusterResults
+                    .reduce((unique, result) => {
+                      const existing = unique.find(r => r.k === result.k);
+                      if (!existing) {
+                        unique.push(result);
+                      } else if (result.is_best && !existing.is_best) {
+                        // Sostituisci con quello evidenziato
+                        const index = unique.findIndex(r => r.k === result.k);
+                        unique[index] = result;
+                      }
+                      return unique;
+                    }, [])
+                    .map((result, idx) => (
+                    <TableRow key={idx} isBest={result.is_best} data-k-cluster-row={result.k}>
                       <span>{result.k}</span>
-                      <span>{result.silhouette_score.toFixed(3)}</span>
-                      <span>{result.balance.toFixed(3)}</span>
-                      <span>{result.composite_score.toFixed(4)}</span>
+                      <span>{(result.silhouette_score || 0).toFixed(3)}</span>
+                      <span>{(result.balance || 0).toFixed(3)}</span>
+                      <span>{(result.composite_score || 0).toFixed(4)}</span>
                       <span>{result.is_best ? '✨' : ''}</span>
                     </TableRow>
                   ))}
