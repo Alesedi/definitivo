@@ -20,9 +20,11 @@ if not TMDB_API_KEY:
 def connetti_mongodb():
     """Connette a MongoDB Atlas con alias 'default'."""
     connect(host=MONGODB_URI, alias="default")
-    print("✅ Connessione a MongoDB Atlas riuscita!")
+    # Avoid printing non-encodable characters in Windows console
+    print("Connessione a MongoDB Atlas riuscita!")
 
 # Connessione al DB all'import
 connetti_mongodb()
 
-print("✅ TMDB API configurata correttamente")
+# Evita caratteri emoji che possono causare UnicodeEncodeError sulla console Windows
+print("TMDB API configurata correttamente")

@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 from route import auth, generi, onboarding, ratings, recommendations, admin
 from database.connessione import connetti_mongodb
@@ -26,6 +27,18 @@ async def root():
 async def say_hello(name: str):
     return {"message": f"Hello {name}"}
 
+
+@app.get("/favicon.ico")
+async def favicon():
+    """Serve una favicon SVG minimale per evitare 404 nel browser durante sviluppo."""
+    svg = '''
+    <svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'>
+      <rect width='100%' height='100%' fill='#1e3a8a'/>
+      <text x='50%' y='54%' font-size='36' text-anchor='middle' fill='white' font-family='Arial' font-weight='700'>A</text>
+    </svg>
+    '''.strip()
+    return Response(content=svg, media_type="image/svg+xml")
+
 # Connessione a MongoDB
 connetti_mongodb()
 
@@ -36,8 +49,8 @@ async def startup_event():
     try:
         change_monitor.start_monitoring()
     except Exception as e:
-        print(f"⚠️ Impossibile avviare Change Stream Monitor: {e}")
-        print("💡 Se usi MongoDB Atlas, usa i Triggers invece dei Change Streams")
+        print(f"Impossibile avviare Change Stream Monitor: {e}")
+        print("Se usi MongoDB Atlas, usa i Triggers invece dei Change Streams")
 
 # Ferma il monitor alla chiusura
 @app.on_event("shutdown")

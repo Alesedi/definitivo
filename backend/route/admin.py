@@ -421,7 +421,7 @@ async def get_k_optimization_status():
         raise HTTPException(status_code=500, detail=f"Errore stato K: {str(e)}")
 
 @router.get("/stream-k-optimization")
-async def stream_k_optimization():
+async def stream_k_optimization(source: Optional[str] = None):
     """Streaming real-time dell'ottimizzazione K-values"""
     
     def generate_optimization_stream() -> Generator[str, None, None]:
@@ -434,24 +434,38 @@ async def stream_k_optimization():
             logger.info(f"✅ Parametri K forzati per ottimizzazione: n_components={ml_service.n_components}, current_k_factor={ml_service.current_k_factor}, actual_k_used={ml_service.actual_k_used}")
             
             # Preparazione dati - USA TMDB per training ibrido!
-            yield f"data: {json.dumps({'type': 'status', 'message': 'Preparazione dati...', 'progress': 0})}\n\n"
+            def send(obj: dict) -> str:
+                # Attach source if provided so frontend can route per-source
+                if source:
+                    obj['source'] = source
+                return f"data: {json.dumps(obj)}\n\n"
+
+            yield send({'type': 'status', 'message': 'Preparazione dati...', 'progress': 0})
             
             # Determina quale dataset usare per ottimizzazione
-            if hasattr(ml_service, 'use_tmdb_training') and ml_service.use_tmdb_training:
-                # TRAINING IBRIDO: usa dati TMDB per ottimizzazione
+            if source == 'tmdb':
+                # Forza TMDB se richiesto
                 df = ml_service._get_or_generate_tmdb_data()
-                yield f"data: {json.dumps({'type': 'status', 'message': f'Usando dataset TMDB per ottimizzazione: {len(df)} rating', 'progress': 5})}\n\n"
+                yield send({'type': 'status', 'message': f'Usando dataset TMDB per ottimizzazione: {len(df)} rating', 'progress': 5})
+            elif source == 'omdb':
+                # Forza OMDb se richiesto
+                df = ml_service._get_or_generate_omdb_data()
+                yield send({'type': 'status', 'message': f'Usando dataset OMDb per ottimizzazione: {len(df)} rating', 'progress': 5})
             else:
-                # TRAINING AFLIX-ONLY: usa dati AFlix
-                df = ml_service.prepare_data()
-                yield f"data: {json.dumps({'type': 'status', 'message': f'Usando dataset AFlix per ottimizzazione: {len(df)} rating', 'progress': 5})}\n\n"
+                # Default behavior: usa flag di configurazione del servizio
+                if hasattr(ml_service, 'use_tmdb_training') and ml_service.use_tmdb_training:
+                    df = ml_service._get_or_generate_tmdb_data()
+                    yield send({'type': 'status', 'message': f'Usando dataset TMDB per ottimizzazione: {len(df)} rating', 'progress': 5})
+                else:
+                    df = ml_service.prepare_data()
+                    yield send({'type': 'status', 'message': f'Usando dataset AFlix per ottimizzazione: {len(df)} rating', 'progress': 5})
                 
             if len(df) < 10:
-                yield f"data: {json.dumps({'type': 'error', 'message': 'Dati insufficienti per ottimizzazione'})}\n\n"
+                yield send({'type': 'error', 'message': 'Dati insufficienti per ottimizzazione'})
                 return
                 
             # Crea matrice
-            yield f"data: {json.dumps({'type': 'status', 'message': 'Creazione matrice ratings...', 'progress': 10})}\n\n"
+            yield send({'type': 'status', 'message': 'Creazione matrice ratings...', 'progress': 10})
             
             user_encoder = LabelEncoder()
             movie_encoder = LabelEncoder()
@@ -463,7 +477,7 @@ async def stream_k_optimization():
                 shape=(df['user_idx'].nunique(), df['movie_idx'].nunique())
             )
             
-            yield f"data: {json.dumps({'type': 'matrix_info', 'shape': ratings_matrix.shape, 'density': ratings_matrix.nnz / (ratings_matrix.shape[0] * ratings_matrix.shape[1])})}\n\n"
+            yield send({'type': 'matrix_info', 'shape': ratings_matrix.shape, 'density': ratings_matrix.nnz / (ratings_matrix.shape[0] * ratings_matrix.shape[1])})
             
             # Inizializza variabili per K ottimali
             optimal_k_svd_final = getattr(ml_service, 'current_k_factor', 30)
@@ -549,34 +563,34 @@ async def stream_k_optimization():
                                 'is_best': bool(is_winner),  # Solo l'ultimo se vincitore
                                 'progress': int(progress)
                             }
-                            yield f"data: {json.dumps(result)}\n\n"
+                            yield send(result)
                             time.sleep(0.1)  # Simula calcolo
                             
                         except Exception as e:
-                            yield f"data: {json.dumps({'type': 'warning', 'message': f'Errore K-SVD {k}: {str(e)}'})}\n\n"
+                            yield send({'type': 'warning', 'message': f'Errore K-SVD {k}: {str(e)}'})
                             continue
                 
                 if best_k_svd:
                     # 🔧 FIX: Aggiorna il vincitore esistente invece di aggiungere duplicato
-                    yield f"data: {json.dumps({'type': 'k_svd_winner_update', 'winner_k': int(best_k_svd)})}\n\n"
+                    yield send({'type': 'k_svd_winner_update', 'winner_k': int(best_k_svd)})
                     
                     # K ottimale trovato per test set AFlix  
                     optimal_k_svd_final = best_k_svd
-                    yield f"data: {json.dumps({'type': 'k_svd_optimal', 'optimal_k': int(best_k_svd), 'score': safe_float(best_score_svd), 'note': f'Ottimale per test set AFlix (training usa K={ml_service.current_k_factor})'})}\n\n"
+                    yield send({'type': 'k_svd_optimal', 'optimal_k': int(best_k_svd), 'score': safe_float(best_score_svd), 'note': f'Ottimale per test set AFlix (training usa K={ml_service.current_k_factor})'})
                 else:
                     # Strategia alternativa per dataset piccoli
                     if len(k_range) == 0:
                         # Dataset troppo piccolo - usa K attuale del training
                         current_k = getattr(ml_service, 'current_k_factor', 25)  # 🔧 FIX: Default 25 (non più 50!)
                         optimal_k_svd_final = current_k
-                        yield f"data: {json.dumps({'type': 'k_svd_optimal', 'optimal_k': int(current_k), 'score': 0.0, 'note': f'K training ibrido (test set troppo piccolo per ottimizzazione)'})}\n\n"
+                        yield send({'type': 'k_svd_optimal', 'optimal_k': int(current_k), 'score': 0.0, 'note': f'K training ibrido (test set troppo piccolo per ottimizzazione)'})
                     else:
                         optimal_k_svd_final = getattr(ml_service, 'current_k_factor', 30)
-                        yield f"data: {json.dumps({'type': 'warning', 'message': 'Nessun K-SVD ottimale trovato'})}\n\n"
+                        yield send({'type': 'warning', 'message': 'Nessun K-SVD ottimale trovato'})
             
             # Ottimizzazione K-Cluster
             if ml_service.auto_optimize_k_cluster:
-                yield f"data: {json.dumps({'type': 'phase', 'phase': 'k_cluster', 'message': 'Inizio ottimizzazione K-Cluster...', 'progress': 60})}\n\n"
+                yield send({'type': 'phase', 'phase': 'k_cluster', 'message': 'Inizio ottimizzazione K-Cluster...', 'progress': 60})
                 
                 # Prepara dati per clustering
                 try:
@@ -589,7 +603,7 @@ async def stream_k_optimization():
                         cluster_data = np.column_stack([U_cluster[:, 0], np.random.normal(0, 0.1, U_cluster.shape[0])])
                         
                 except Exception as e:
-                    yield f"data: {json.dumps({'type': 'error', 'message': f'Errore preparazione clustering: {str(e)}'})}\n\n"
+                    yield send({'type': 'error', 'message': f'Errore preparazione clustering: {str(e)}'})
                     return
                 
                 best_k_cluster = None
@@ -637,28 +651,28 @@ async def stream_k_optimization():
                             'is_best': False,  # Sempre False durante i test
                             'progress': int(progress)
                         }
-                        yield f"data: {json.dumps(result)}\n\n"
+                        yield send(result)
                         time.sleep(0.1)  # Simula calcolo
                         
                     except Exception as e:
-                        yield f"data: {json.dumps({'type': 'warning', 'message': f'Errore K-Cluster {k}: {str(e)}'})}\n\n"
+                        yield send({'type': 'warning', 'message': f'Errore K-Cluster {k}: {str(e)}'})
                         continue
                 
                 if best_k_cluster:
                     # 🔧 FIX: Aggiorna il vincitore esistente invece di aggiungere duplicato
-                    yield f"data: {json.dumps({'type': 'k_cluster_winner_update', 'winner_k': int(best_k_cluster)})}\n\n"
+                    yield send({'type': 'k_cluster_winner_update', 'winner_k': int(best_k_cluster)})
                     
                     ml_service.n_clusters = best_k_cluster
-                    yield f"data: {json.dumps({'type': 'k_cluster_optimal', 'optimal_k': int(best_k_cluster), 'score': safe_float(best_score_cluster)})}\n\n"
+                    yield send({'type': 'k_cluster_optimal', 'optimal_k': int(best_k_cluster), 'score': safe_float(best_score_cluster)})
             
             # Completamento - USA I K OTTIMALI TROVATI, NON I VALORI DI CONFIGURAZIONE
             final_k_svd = optimal_k_svd_final if 'optimal_k_svd_final' in locals() else getattr(ml_service, 'current_k_factor', 30)
             final_k_cluster = best_k_cluster if best_k_cluster else ml_service.n_clusters
             
-            yield f"data: {json.dumps({'type': 'completed', 'message': 'Ottimizzazione completata con successo!', 'progress': 100, 'final_k_svd': int(final_k_svd), 'final_k_cluster': int(final_k_cluster)})}\n\n"
+            yield send({'type': 'completed', 'message': 'Ottimizzazione completata con successo!', 'progress': 100, 'final_k_svd': int(final_k_svd), 'final_k_cluster': int(final_k_cluster)})
             
         except Exception as e:
-            yield f"data: {json.dumps({'type': 'error', 'message': f'Errore generale: {str(e)}'})}\n\n"
+            yield send({'type': 'error', 'message': f'Errore generale: {str(e)}'})
     
     return StreamingResponse(
         generate_optimization_stream(),

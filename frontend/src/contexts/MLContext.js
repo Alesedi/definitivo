@@ -1,10 +1,15 @@
 import React, { createContext, useContext, useReducer, useCallback } from 'react';
 import api from '../services/api';
+import { recommendationsAPI } from '../services/api';
 
 // Stato iniziale
 const initialState = {
   // Stato del modello
   modelStatus: null,
+    modelStatusBySource: {
+      tmdb: null,
+      omdb: null
+    },
   isTraining: false,
   
   // Raccomandazioni
@@ -12,6 +17,15 @@ const initialState = {
   userHistory: [],
   evaluation: null,
   clustering: null,
+    // Per-sorgente (tmdb / omdb)
+    evaluationBySource: {
+      tmdb: null,
+      omdb: null
+    },
+    clusteringBySource: {
+      tmdb: null,
+      omdb: null
+    },
   
   // Monitor ML
   logs: [],
@@ -27,6 +41,29 @@ const initialState = {
     optimalResults: {},
     matrixInfo: null,
     isOptimizing: false
+  },
+  // Stato per sorgente (tmdb / omdb) - permette split-view futuro
+  kOptimizationBySource: {
+    tmdb: {
+      status: 'idle',
+      progress: 0,
+      currentPhase: null,
+      kSvdResults: [],
+      kClusterResults: [],
+      optimalResults: {},
+      matrixInfo: null,
+      isOptimizing: false
+    },
+    omdb: {
+      status: 'idle',
+      progress: 0,
+      currentPhase: null,
+      kSvdResults: [],
+      kClusterResults: [],
+      optimalResults: {},
+      matrixInfo: null,
+      isOptimizing: false
+    }
   },
   
   // Stato generale
@@ -72,6 +109,17 @@ const ML_ACTIONS = {
 const mlReducer = (state, action) => {
   switch (action.type) {
     case ML_ACTIONS.SET_MODEL_STATUS:
+      // Supporta payload.source per memorizzare lo stato per sorgente
+      if (action.payload && action.payload.source) {
+        const src = action.payload.source;
+        const payloadCopy = { ...action.payload };
+        delete payloadCopy.source;
+        return {
+          ...state,
+          modelStatus: payloadCopy,
+          modelStatusBySource: { ...state.modelStatusBySource, [src]: payloadCopy }
+        };
+      }
       return { ...state, modelStatus: action.payload };
       
     case ML_ACTIONS.SET_TRAINING:
@@ -84,17 +132,47 @@ const mlReducer = (state, action) => {
       return { ...state, userHistory: action.payload };
       
     case ML_ACTIONS.SET_EVALUATION:
+      // Supporta payload.source per memorizzare evaluation per sorgente
+      if (action.payload && action.payload.source) {
+        const src = action.payload.source;
+        const payloadCopy = { ...action.payload };
+        delete payloadCopy.source;
+        return {
+          ...state,
+          evaluation: payloadCopy,
+          evaluationBySource: { ...state.evaluationBySource, [src]: payloadCopy }
+        };
+      }
       return { ...state, evaluation: action.payload };
       
     case ML_ACTIONS.SET_CLUSTERING:
+      // Supporta payload.source per memorizzare clustering per sorgente
+      if (action.payload && action.payload.source) {
+        const src = action.payload.source;
+        const payloadCopy = { ...action.payload };
+        delete payloadCopy.source;
+        return {
+          ...state,
+          clustering: payloadCopy,
+          clusteringBySource: { ...state.clusteringBySource, [src]: payloadCopy }
+        };
+      }
       return { ...state, clustering: action.payload };
       
     case ML_ACTIONS.ADD_LOG:
+      // Evita duplicati consecutivi (stesso messaggio + type)
+      const lastLog = state.logs.length > 0 ? state.logs[state.logs.length - 1] : null;
+      const incomingMessage = action.payload.message;
+      const incomingType = action.payload.type || 'info';
+      if (lastLog && lastLog.message === incomingMessage && lastLog.type === incomingType) {
+        // non aggiungere duplicato consecutivo
+        return state;
+      }
       const newLog = {
         id: Date.now(),
         timestamp: new Date().toLocaleTimeString(),
-        message: action.payload.message,
-        type: action.payload.type || 'info'
+        message: incomingMessage,
+        type: incomingType
       };
       return {
         ...state,
@@ -108,24 +186,76 @@ const mlReducer = (state, action) => {
       return { ...state, isAutoRefresh: action.payload };
       
     case ML_ACTIONS.SET_K_OPTIMIZATION_STATUS:
+      if (action.payload && action.payload.source) {
+        const src = action.payload.source;
+        const payloadCopy = { ...action.payload };
+        delete payloadCopy.source;
+        return {
+          ...state,
+          kOptimizationBySource: {
+            ...state.kOptimizationBySource,
+            [src]: { ...state.kOptimizationBySource[src], status: payloadCopy }
+          }
+        };
+      }
       return {
         ...state,
         kOptimization: { ...state.kOptimization, status: action.payload }
       };
       
     case ML_ACTIONS.SET_K_OPTIMIZATION_PROGRESS:
+      if (action.payload && action.payload.source) {
+        const src = action.payload.source;
+        const payloadCopy = { ...action.payload };
+        delete payloadCopy.source;
+        return {
+          ...state,
+          kOptimizationBySource: {
+            ...state.kOptimizationBySource,
+            [src]: { ...state.kOptimizationBySource[src], progress: payloadCopy }
+          }
+        };
+      }
       return {
         ...state,
         kOptimization: { ...state.kOptimization, progress: action.payload }
       };
       
     case ML_ACTIONS.SET_K_OPTIMIZATION_PHASE:
+      if (action.payload && action.payload.source) {
+        const src = action.payload.source;
+        const payloadCopy = { ...action.payload };
+        delete payloadCopy.source;
+        return {
+          ...state,
+          kOptimizationBySource: {
+            ...state.kOptimizationBySource,
+            [src]: { ...state.kOptimizationBySource[src], currentPhase: payloadCopy }
+          }
+        };
+      }
       return {
         ...state,
         kOptimization: { ...state.kOptimization, currentPhase: action.payload }
       };
       
     case ML_ACTIONS.ADD_K_SVD_RESULT:
+      // Se payload contiene source -> aggiorna namespace per sorgente, altrimenti aggiorna il namespace globale
+      if (action.payload && action.payload.source) {
+        const src = action.payload.source;
+        const entry = { ...action.payload };
+        delete entry.source;
+        return {
+          ...state,
+          kOptimizationBySource: {
+            ...state.kOptimizationBySource,
+            [src]: {
+              ...state.kOptimizationBySource[src],
+              kSvdResults: [...state.kOptimizationBySource[src].kSvdResults, entry]
+            }
+          }
+        };
+      }
       return {
         ...state,
         kOptimization: {
@@ -135,6 +265,21 @@ const mlReducer = (state, action) => {
       };
       
     case ML_ACTIONS.ADD_K_CLUSTER_RESULT:
+      if (action.payload && action.payload.source) {
+        const src = action.payload.source;
+        const entry = { ...action.payload };
+        delete entry.source;
+        return {
+          ...state,
+          kOptimizationBySource: {
+            ...state.kOptimizationBySource,
+            [src]: {
+              ...state.kOptimizationBySource[src],
+              kClusterResults: [...state.kOptimizationBySource[src].kClusterResults, entry]
+            }
+          }
+        };
+      }
       return {
         ...state,
         kOptimization: {
@@ -144,6 +289,22 @@ const mlReducer = (state, action) => {
       };
       
     case ML_ACTIONS.SET_OPTIMAL_RESULTS:
+      // Supporta payload.source per aggiornare risultati per sorgente
+      if (action.payload && action.payload.source) {
+        const src = action.payload.source;
+        const payloadCopy = { ...action.payload };
+        delete payloadCopy.source;
+        return {
+          ...state,
+          kOptimizationBySource: {
+            ...state.kOptimizationBySource,
+            [src]: {
+              ...state.kOptimizationBySource[src],
+              optimalResults: { ...state.kOptimizationBySource[src].optimalResults, ...payloadCopy }
+            }
+          }
+        };
+      }
       return {
         ...state,
         kOptimization: {
@@ -153,24 +314,53 @@ const mlReducer = (state, action) => {
       };
       
     case ML_ACTIONS.SET_MATRIX_INFO:
+      if (action.payload && action.payload.source) {
+        const src = action.payload.source;
+        const payloadCopy = { ...action.payload };
+        delete payloadCopy.source;
+        return {
+          ...state,
+          kOptimizationBySource: {
+            ...state.kOptimizationBySource,
+            [src]: { ...state.kOptimizationBySource[src], matrixInfo: payloadCopy }
+          }
+        };
+      }
       return {
         ...state,
         kOptimization: { ...state.kOptimization, matrixInfo: action.payload }
       };
       
     case ML_ACTIONS.SET_K_OPTIMIZING:
+      // action.meta.source is also supported inside payload.source
+      if (action.payload && typeof action.payload === 'object' && action.payload.source) {
+        const src = action.payload.source;
+        const flag = action.payload.flag !== undefined ? action.payload.flag : action.payload;
+        return {
+          ...state,
+          kOptimizationBySource: {
+            ...state.kOptimizationBySource,
+            [src]: { ...state.kOptimizationBySource[src], isOptimizing: flag }
+          }
+        };
+      }
       return {
         ...state,
         kOptimization: { ...state.kOptimization, isOptimizing: action.payload }
       };
       
     case ML_ACTIONS.RESET_K_OPTIMIZATION:
+      // Resetta sia namespace globale che namespaces per sorgente
       return {
         ...state,
         kOptimization: {
           ...initialState.kOptimization,
-          optimalResults: state.kOptimization.optimalResults, // Preserva i risultati precedenti
+          optimalResults: state.kOptimization.optimalResults,
           isOptimizing: false
+        },
+        kOptimizationBySource: {
+          tmdb: { ...initialState.kOptimization },
+          omdb: { ...initialState.kOptimization }
         }
       };
       
@@ -204,44 +394,49 @@ export const MLProvider = ({ children }) => {
   }, []);
 
   // API Functions
-  const fetchModelStatus = useCallback(async () => {
+  const fetchModelStatus = useCallback(async (source = 'tmdb') => {
     try {
-      const response = await api.get('/api/recommendations/status');
-      dispatch({ type: ML_ACTIONS.SET_MODEL_STATUS, payload: response.data });
+      const response = await recommendationsAPI.getModelStatus(source);
+      // Includi la sorgente nel payload così il reducer può salvarlo per-source
+      const payload = { ...response.data, source };
+      dispatch({ type: ML_ACTIONS.SET_MODEL_STATUS, payload });
       return response.data;
     } catch (error) {
       console.error('Error fetching model status:', error);
-      dispatch({ 
-        type: ML_ACTIONS.SET_ERROR, 
-        payload: 'Errore nel recupero dello stato del modello' 
+      dispatch({
+        type: ML_ACTIONS.SET_ERROR,
+        payload: 'Errore nel recupero dello stato del modello'
       });
       addLog(`❌ Errore connessione backend: ${error.message}`, 'error');
       return null;
     }
   }, [addLog]);
 
-  const trainModel = useCallback(async () => {
+  const trainModel = useCallback(async (source = null) => {
     dispatch({ type: ML_ACTIONS.SET_TRAINING, payload: true });
     dispatch({ type: ML_ACTIONS.SET_LOADING, payload: true });
     dispatch({ type: ML_ACTIONS.CLEAR_ERROR });
     addLog('🚀 Avvio training del modello...', 'info');
     
     try {
-      const response = await api.get('/api/recommendations/train-sync');
-      const result = response.data;
+  const resp = await recommendationsAPI.trainModel(source || 'tmdb');
+  const result = resp.data;
       
       addLog('✅ Training completato con successo!', 'success');
       
-      // Aggiorna status del modello che mostrerà le statistiche aggiornate
-      setTimeout(() => {
-        fetchModelStatus().then(status => {
-          if (status) {
-            addLog(`📊 Statistiche: ${status.total_ratings || 0} rating processati`, 'info');
-            addLog(`🎯 K utilizzato: ${status.actual_k_used || 'N/A'}`, 'info');
-            addLog(`📈 Varianza spiegata: ${(status.explained_variance * 100 || 0).toFixed(1)}%`, 'info');
-          }
-        });
-      }, 500);
+      // Aggiorna immediatamente lo stato del modello per la sorgente specificata e mostra metriche
+      try {
+        const status = await fetchModelStatus(source || 'tmdb');
+        if (status) {
+          const srcLabel = source || 'tmdb';
+          addLog(`📊 Statistiche (${srcLabel}): ${status.total_ratings || 0} rating processati`, 'info');
+          addLog(`🎯 K utilizzato: ${status.actual_k_used || 'N/A'}`, 'info');
+          addLog(`📈 Varianza spiegata: ${(status.explained_variance * 100 || 0).toFixed(1)}%`, 'info');
+        }
+      } catch (e) {
+        // se fetchModelStatus fallisce, non blocchiamo il flusso
+        addLog('⚠️ Non è stato possibile aggiornare immediatamente lo stato del modello', 'warning');
+      }
       
       return result;
     } catch (error) {
@@ -259,14 +454,14 @@ export const MLProvider = ({ children }) => {
     }
   }, [addLog, fetchModelStatus]);
 
-  const fetchRecommendations = useCallback(async (userId, topN = 10) => {
+  const fetchRecommendations = useCallback(async (userId, topN = 10, source = 'tmdb') => {
     dispatch({ type: ML_ACTIONS.SET_LOADING, payload: true });
     dispatch({ type: ML_ACTIONS.CLEAR_ERROR });
     
     try {
-      const response = await api.get(`/api/recommendations/user/${userId}?top_n=${topN}`);
+      const response = await recommendationsAPI.getRecommendations(userId, topN, source);
       dispatch({ type: ML_ACTIONS.SET_RECOMMENDATIONS, payload: response.data });
-      addLog(`✅ Caricate ${response.data.length} raccomandazioni`, 'success');
+      addLog(`✅ Caricate ${response.data.length} raccomandazioni (${source})`, 'success');
       return response.data;
     } catch (error) {
       console.error('Error fetching recommendations:', error);
@@ -305,14 +500,16 @@ export const MLProvider = ({ children }) => {
     }
   }, [addLog]);
 
-  const fetchEvaluation = useCallback(async () => {
+  const fetchEvaluation = useCallback(async (source = 'tmdb') => {
     dispatch({ type: ML_ACTIONS.SET_LOADING, payload: true });
     dispatch({ type: ML_ACTIONS.CLEAR_ERROR });
     
     try {
-      const response = await api.get('/api/recommendations/evaluation');
-      dispatch({ type: ML_ACTIONS.SET_EVALUATION, payload: response.data });
-      addLog('✅ Valutazione modello completata', 'success');
+      const response = await recommendationsAPI.getEvaluation(source);
+      // Includiamo source nel payload per la memorizzazione per-sorgente
+      const payload = { ...response.data, source };
+      dispatch({ type: ML_ACTIONS.SET_EVALUATION, payload });
+      addLog(`✅ Valutazione modello completata (${source})`, 'success');
       return response.data;
     } catch (error) {
       console.error('Error fetching evaluation:', error);
@@ -328,14 +525,15 @@ export const MLProvider = ({ children }) => {
     }
   }, [addLog]);
 
-  const fetchClustering = useCallback(async () => {
+  const fetchClustering = useCallback(async (source = 'tmdb') => {
     dispatch({ type: ML_ACTIONS.SET_LOADING, payload: true });
     dispatch({ type: ML_ACTIONS.CLEAR_ERROR });
     
     try {
-      const response = await api.get('/api/recommendations/clustering');
-      dispatch({ type: ML_ACTIONS.SET_CLUSTERING, payload: response.data });
-      addLog('✅ Clustering caricato con successo', 'success');
+      const response = await recommendationsAPI.getClustering(source);
+      const payload = { ...response.data, source };
+      dispatch({ type: ML_ACTIONS.SET_CLUSTERING, payload });
+      addLog(`✅ Clustering (${source}) caricato con successo`, 'success');
       return response.data;
     } catch (error) {
       console.error('Error fetching clustering:', error);
@@ -362,11 +560,19 @@ export const MLProvider = ({ children }) => {
   }, [addLog]);
 
   // K-Optimization Functions
-  const startKOptimization = useCallback(() => {
+  const startKOptimization = useCallback((source = null) => {
+    // Resetta gli stati di ottimizzazione (global e per-sorgente) per partire puliti
     dispatch({ type: ML_ACTIONS.RESET_K_OPTIMIZATION });
-    dispatch({ type: ML_ACTIONS.SET_K_OPTIMIZING, payload: true });
-    dispatch({ type: ML_ACTIONS.SET_K_OPTIMIZATION_STATUS, payload: 'running' });
-    addLog('🚀 Avvio ottimizzazione K-values...', 'info');
+    // Imposta lo stato isOptimizing per la sorgente specificata o globalmente
+    if (source) {
+      dispatch({ type: ML_ACTIONS.SET_K_OPTIMIZING, payload: { source, flag: true } });
+      dispatch({ type: ML_ACTIONS.SET_K_OPTIMIZATION_STATUS, payload: { source, status: 'running' } });
+      addLog(`🚀 Avvio ottimizzazione K-values (${source.toUpperCase()})...`, 'info');
+    } else {
+      dispatch({ type: ML_ACTIONS.SET_K_OPTIMIZING, payload: true });
+      dispatch({ type: ML_ACTIONS.SET_K_OPTIMIZATION_STATUS, payload: 'running' });
+      addLog('🚀 Avvio ottimizzazione K-values (globale)...', 'info');
+    }
   }, [addLog]);
 
   const stopKOptimization = useCallback((userTriggered = true) => {
@@ -381,6 +587,9 @@ export const MLProvider = ({ children }) => {
   const value = {
     // State
     ...state,
+    // Helpers per-source
+    getKOptimizationForSource: (source) => state.kOptimizationBySource && state.kOptimizationBySource[source] ? state.kOptimizationBySource[source] : null,
+    getAllSources: () => Object.keys(state.kOptimizationBySource || {}),
     
     // Actions
     addLog,
@@ -391,38 +600,41 @@ export const MLProvider = ({ children }) => {
     
     // API Functions
     fetchModelStatus,
-    trainModel,
-    fetchRecommendations,
-    fetchUserHistory,
-    fetchEvaluation,
-    fetchClustering,
+  trainModel,
+  fetchRecommendations,
+  fetchUserHistory,
+  fetchEvaluation,
+  fetchClustering,
+  // Helpers per-sorgente
+  getEvaluationForSource: (source) => state.evaluationBySource ? state.evaluationBySource[source] : null,
+  getClusteringForSource: (source) => state.clusteringBySource ? state.clusteringBySource[source] : null,
     
     // K-Optimization Functions
     startKOptimization,
     stopKOptimization,
-    setKOptimizationProgress: (progress) => dispatch({ 
+    setKOptimizationProgress: (progress, source = null) => dispatch({ 
       type: ML_ACTIONS.SET_K_OPTIMIZATION_PROGRESS, 
-      payload: progress 
+      payload: source ? { progress, source } : progress 
     }),
-    setKOptimizationPhase: (phase) => dispatch({ 
+    setKOptimizationPhase: (phase, source = null) => dispatch({ 
       type: ML_ACTIONS.SET_K_OPTIMIZATION_PHASE, 
-      payload: phase 
+      payload: source ? { ...phase, source } : phase 
     }),
-    addKSvdResult: (result) => dispatch({ 
+    addKSvdResult: (result, source = null) => dispatch({ 
       type: ML_ACTIONS.ADD_K_SVD_RESULT, 
-      payload: result 
+      payload: source ? { ...result, source } : result 
     }),
-    addKClusterResult: (result) => dispatch({ 
+    addKClusterResult: (result, source = null) => dispatch({ 
       type: ML_ACTIONS.ADD_K_CLUSTER_RESULT, 
-      payload: result 
+      payload: source ? { ...result, source } : result 
     }),
-    setOptimalResults: (results) => dispatch({ 
+    setOptimalResults: (results, source = null) => dispatch({ 
       type: ML_ACTIONS.SET_OPTIMAL_RESULTS, 
-      payload: results 
+      payload: source ? { ...results, source } : results 
     }),
-    setMatrixInfo: (info) => dispatch({ 
+    setMatrixInfo: (info, source = null) => dispatch({ 
       type: ML_ACTIONS.SET_MATRIX_INFO, 
-      payload: info 
+      payload: source ? { ...info, source } : info 
     })
   };
 

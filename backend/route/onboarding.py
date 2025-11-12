@@ -1,7 +1,11 @@
 from fastapi import APIRouter, HTTPException, Depends
 from typing import List, Dict, Any
 from service.service_tmdb import tmdb_service
-from service.service_csv import csv_service
+try:
+    # service_csv may have been removed/archived; import if present
+    from service.service_csv import csv_service  # type: ignore
+except Exception:
+    csv_service = None
 from modelli_ODM.utente_odm import Utente
 from modello.modello_dto.generi_scelti import GeneriSceltiDTO
 from modello.enum_genere import EnumGenere
@@ -109,9 +113,22 @@ async def get_movies_for_initial_rating(user_id: str) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail="L'utente deve prima selezionare i generi preferiti")
     
     try:
-        # Usa i dati CSV reali invece dei mock
-        movies = csv_service.get_random_movies(50)
-        
+        # Usa i dati CSV reali se disponibili, altrimenti fallback a TMDB
+        if csv_service is not None:
+            try:
+                movies = csv_service.get_random_movies(50)
+            except Exception:
+                movies = None
+        else:
+            movies = None
+
+        # TMDB fallback (async)
+        if not movies:
+            try:
+                movies = await tmdb_service.get_50_movies_for_rating(user.generi_preferiti)
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Errore nel recupero film da TMDB: {e}")
+
         return {
             "message": "Film per valutazione recuperati con successo",
             "movies": movies,

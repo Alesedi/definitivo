@@ -1,0 +1,88 @@
+Progetto: Sistema di Raccomandazioni Ibrido (TMDB / OMDb) — Documentazione sintetica (Italiano)
+
+1) Obiettivo del progetto
+Questo progetto costruisce e compara due istanze di un motore di raccomandazione ibrido, entrambe eseguendo lo stesso pipeline ML (SVD per proiezione + K-optimization per selezione iperparametri + clustering) ma usando due sorgenti di metadata sintetici: TMDB e OMDb. Lo scopo è confrontare le performance finali (RMSE, MAE, varianza spiegata, mapping coverage) e mantenere un fallback "per-sorgente" (popular list) per evitare che una caduta nel fallback globale renda i modelli indistinguibili.
+
+2) Panoramica del modello ibrido (training e test)
+- Hybrid training: il servizio costruisce un dataset di training combinando voti reali (AFlix) con metadata esterni sintetici (TMDB o OMDb). I voti effettivi (userId, title, rating, timestamp) provengono dal DB AFlix; i metadata (poster, titolo canonico, generi) vengono integrati dalla sorgente scelta. Quando la sorgente non fornisce tutti i campi, il sistema riempie i poster mancanti con un placeholder e costruisce una popular list separata per quella sorgente.
+- Test su AFlix: la valutazione (RMSE/MAE) viene eseguita su un test set estratto dagli utenti/voti AFlix (holdout). Questo assicura che la misura di errore rifletta la capacità del modello di predire i voti reali degli utenti AFlix, indipendentemente dalla sorgente dei metadata.
+
+3) Algoritmi ML usati (dettaglio)
+- Matrice di rating (user × movie): costruiamo una matrice sparsa con righe corrispondenti agli utenti AFlix (user_idx) e colonne corrispondenti alle entità film mappate (movie_idx, derivato da title o id). Il valore è il rating.
+  - Formato: csr_matrix((ratings, (user_idx, movie_idx)), shape=(n_users, n_movies))
+  - n_users = numero di utenti unici nel DF di training
+  - n_movies = numero di film unici nel DF di training
+  - densità = nnz / (n_users * n_movies)
+
+- SVD (truncated / sparse): usiamo due passaggi correlati:
+  1. svds (scipy.sparse.linalg.svds) per estrarre fattori U, sigma, Vt quando la matrice è sparsa e occorre scalare.
+  2. TruncatedSVD (sklearn) utilizzata per calcolare la varianza spiegata delle prime k componenti (explained_variance_ratio_). Questa combinazione ci permette di avere sia una decomposizione efficiente sia una misura interpretabile della varianza.
+
+- K-optimization (ricerca del k ottimale): processo a due step
+  1. Ottimizzazione K-SVD (k per SVD): testiamo una serie di valori k (range dinamico, in base alla dimensione della matrice). Per ogni k calcoliamo:
+     - explained_variance = somma delle explained_variance_ratio_ per i primi k componenti
+     - efficiency = explained_variance / k
+     - overfitting_penalty = k / n_samples (n_samples = min(n_users, n_movies))
+     - composite_score = explained_variance * 0.5 + efficiency * 0.3 + (1.0 - overfitting_penalty) * 0.2
+    Pesi scelti (ragionamento):
+     - explained_variance (50%): vogliamo che k spieghi più varianza possibile
+     - efficiency (30%): preferiamo modelli compatti che ottengono più varianza per componente
+     - penalità overfitting (20%): penalizziamo k troppo grandi rispetto alla dimensione del dataset
+    Nota: i pesi riflettono una trade-off pratico e possono essere affinati con esperienza o cross-validation.
+
+  2. Ottimizzazione K-Cluster (k per clustering): dopo aver ottenuto una proiezione (tipicamente righe di U o le prime 2 componenti), testiamo varie k per KMeans e calcoliamo:
+     - silhouette_score (60% del punteggio): misura compattezza/separazione
+     - balance (30%): equidistribuzione dei punti fra cluster (1 - std/mean)
+     - interpretability (10%): 1/k (preferiamo pochi cluster per facilità d'interpretazione)
+     - k_bonus: nel codice corrente è previsto un bonus per k==4 (25%) come preferenza sperimentale per dataset AFlix.
+    composite_score_cluster = silhouette * 0.6 + balance * 0.3 + interpretability * 0.1 + k_bonus
+
+- Clustering: KMeans (sklearn), silhouette_score per la qualità.
+
+4) Significato degli indicatori (MAE, RMSE, Varianza spiegata)
+- RMSE (Root Mean Square Error): radice della media degli errori quadratici. Sensibile a grandi errori (outliers). Valori più bassi indicano previsioni più accurate.
+- MAE (Mean Absolute Error): media assoluta degli errori, meno sensibile agli outliers e più interpretabile come errore medio in unità di rating.
+- Varianza spiegata (explained_variance): somma di explained_variance_ratio_ delle prime k componenti. Indica quanta variabilità del rating è catturata dalla proiezione SVD.
+
+5) Perché i valori osservati (es.: RMSE ≈ 1.31, MAE ≈ 1.09) possono essere relativamente alti
+- I rating in AFlix sono probabilmente su una scala 1-5; un RMSE > 1 indica che il modello non riesce a predire con alta precisione le preferenze degli utenti. Cause comuni:
+  - Dataset piccolo o sparso (bassa densità) → proiezioni SVD meno informative
+  - Copertura di mapping titolo ⇄ AFlix scarsa → parte dei test sample non mappati correttamente
+  - Il metadata esterno (TMDB/OMDb) non migliora significativamente l'informazione utile per predire i rating (sono utili per filtri di contenuto più che per preferenze collaborative)
+  - I sistemi industriali (es. Netflix, Amazon) spesso ottengono RMSE più basse (sotto 1.0, talvolta intorno a 0.8 o meno) grazie a dataset molto più grandi, utili segnali impliciti (click, watch-time), e modelli ibridi molto più complessi (deep learning, side-information avanzata e feature-engineering). Con dataset piccoli/affetti da rumore è normale avere RMSE intorno a 1.0-1.5.
+
+6) Esperienza utente
+- Cosa deve fare l'utente:
+  1. Avviare il training per la sorgente desiderata (Train TMDB / Train OMDb).
+  2. Avviare l'ottimizzazione K per la sorgente (Ottimizza TMDB / Ottimizza OMDb). La UI mostra progresso streaming e risultati intermedi.
+  3. Dopo completion, consultare le raccomandazioni per l'utente (Genera) o vedere il fallback per la sorgente (popular list) se il modello non è disponibile.
+- Risultato: l'utente vede raccomandazioni personalizzate generate dal modello addestrato con la sorgente scelta; la UI espone metriche / diagnostiche (RMSE, MAE, varianza, numero di componenti, mapping coverage) per decidere se riaddestrare/ottimizzare ulteriormente.
+
+7) Linguaggi e librerie principali
+- Backend: Python (FastAPI)
+  - Librerie ML: numpy, scipy (svds), scikit-learn (TruncatedSVD, KMeans, silhouette_score), pandas
+  - Altro: pydantic, motor / mongoengine (ODM), uvicorn
+- Frontend: React (JavaScript), styled-components
+  - Librerie: eventsource (SSE via EventSource), axios / fetch wrapper, react-icons
+
+8) Valori della matrice e formule — dove li prendiamo
+- n_users: conteggio degli userId unici nel DataFrame di training (proviene da AFlix)
+- n_movies: conteggio dei title/identificativi mappati nel DF (dalla sorgente + AFlix mapping)
+- ratings: colonna rating del DF (valori reali AFlix)
+- user_idx / movie_idx: label encoding di userId e title richiesto per costruire la matrice sparsa
+- density = nnz / (n_users * n_movies), dove nnz = numero di rating non-zero (cioè il numero di celle popolate)
+- explained_variance: somma delle explained_variance_ratio_ restituite da TruncatedSVD per i componenti presi
+- efficiency = explained_variance / k
+- overfitting_penalty = k / n_samples  (con n_samples = min(n_users, n_movies))
+- composite_score (SVD) = 0.5*explained_variance + 0.3*efficiency + 0.2*(1 - overfitting_penalty)
+- composite_score (Cluster) = 0.6*silhouette + 0.3*balance + 0.1*interpretability + k_bonus
+
+9) Raccomandazioni e fallback per-sorgente
+- Se il modello non può generare raccomandazioni per un utente (mancanza mapping o modello non addestrato), restituiamo una popular list costruita a partire dai film presenti nella sorgente (TMDB/OMDb) con un placeholder per poster se necessario. Questo mantiene differenze per-sorgente e impedisce che entrambi i modelli restituiscano la stessa lista globale di default.
+
+10) Note operative radicate al progetto
+- I valori e le soglie (es. default k=25, max_k per range, bonus k=4) sono scelte sperimentali e possono essere sintonizzate in base ai risultati di validazione.
+- Per migliorare RMSE/MAE: aumentare dimensione del dataset, migliorare mapping titolo (normalizzazione/fuzzy matching), utilizzare segnali impliciti (tempo di visione) o modelli ibridi più sofisticati (factorization machines, deep learning con side-info).
+
+---
+Se vuoi, posso esportare questa stessa spiegazione in un file Word (.docx) invece del .txt, o generare una versione in inglese. Inoltre posso automatizzare l'estrazione dei valori reali (RMSE/MAE/explained_variance/k ottimali) chiamando gli endpoint `/api/recommendations/diagnostics?source=...` e inserendoli nel JSON dei risultati con valori reali.

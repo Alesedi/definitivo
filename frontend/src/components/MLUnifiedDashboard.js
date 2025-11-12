@@ -1,4 +1,4 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import styled from 'styled-components';
 import { theme } from '../styles/theme';
 import { 
@@ -93,8 +93,8 @@ const ButtonGroup = styled.div`
 
 const StatusGrid = styled.div`
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-  gap: ${theme.spacing.md};
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: ${theme.spacing.lg};
   margin-bottom: ${theme.spacing.lg};
 `;
 
@@ -104,6 +104,7 @@ const MetricCard = styled.div`
   border-radius: ${theme.borderRadius.md};
   text-align: center;
   border: 1px solid ${theme.colors.primaryLighter};
+  min-height: 110px;
 `;
 
 const MetricValue = styled.div`
@@ -250,21 +251,32 @@ const ErrorMessage = styled.div`
 const MLUnifiedDashboard = ({ user }) => {
   const {
     // State
-    modelStatus, isTraining, recommendations, userHistory, evaluation, clustering,
+    modelStatus, modelStatusBySource, isTraining, recommendations, userHistory, evaluation, clustering,
     logs, isAutoRefresh, kOptimization, loading, error,
     
     // Actions
     addLog, clearLogs, setAutoRefresh,
     
     // API Functions
-    fetchModelStatus, trainModel, fetchRecommendations, fetchUserHistory,
+  fetchModelStatus, trainModel, fetchRecommendations, fetchUserHistory,
     fetchEvaluation, fetchClustering,
     
     // K-Optimization Functions
     startKOptimization, stopKOptimization, setKOptimizationProgress,
     setKOptimizationPhase, addKSvdResult, addKClusterResult, 
     setOptimalResults, setMatrixInfo
-  } = useML();
+      , kOptimizationBySource
+    } = useML();
+
+  // Local state per-source recommendations for split-view
+  const [recsTmdb, setRecsTmdb] = useState([]);
+  const [recsOmdb, setRecsOmdb] = useState([]);
+  const [evaluationTmdb, setEvaluationTmdb] = useState(null);
+  const [evaluationOmdb, setEvaluationOmdb] = useState(null);
+  const [clusteringTmdb, setClusteringTmdb] = useState(null);
+  const [clusteringOmdb, setClusteringOmdb] = useState(null);
+  const [selectedClusteringSource, setSelectedClusteringSource] = useState('tmdb');
+  const [showClusterFullscreen, setShowClusterFullscreen] = useState(false);
 
   const eventSourceRef = useRef(null);
   const timeoutRef = useRef(null);
@@ -290,7 +302,9 @@ const MLUnifiedDashboard = ({ user }) => {
     let interval;
     if (isAutoRefresh) {
       interval = setInterval(() => {
-        fetchModelStatus();
+        // Refresh both sources
+        fetchModelStatus('tmdb');
+        fetchModelStatus('omdb');
       }, 3000);
     }
     return () => clearInterval(interval);
@@ -298,7 +312,9 @@ const MLUnifiedDashboard = ({ user }) => {
 
   // Caricamento iniziale
   useEffect(() => {
-    fetchModelStatus();
+    // Fetch status for both sources so UI shows per-source readiness
+    fetchModelStatus('tmdb');
+    fetchModelStatus('omdb');
     // Rimuoviamo il log duplicato - inizializzazione silenziosa
   }, [fetchModelStatus]);
 
@@ -310,14 +326,16 @@ const MLUnifiedDashboard = ({ user }) => {
   }, [modelStatus?.is_trained, clustering, fetchClustering]);
 
   // Gestione K-Optimization Streaming
-  const handleKOptimization = async () => {
+  const handleKOptimization = async (source = null) => {
     if (kOptimization.isOptimizing) return;
     
-    addLog('🚀 Avvio ottimizzazione K...', 'info');
-    startKOptimization();
+  addLog('🚀 Avvio ottimizzazione K...', 'info');
+  // Imposta lo stato di ottimizzazione per la sorgente specificata (se presente)
+  startKOptimization(source);
     
-    // Crea EventSource per streaming
-    eventSourceRef.current = new EventSource('/api/admin/stream-k-optimization');
+  // Crea EventSource per streaming con parametro sorgente
+  const streamUrl = source ? `/api/admin/stream-k-optimization?source=${encodeURIComponent(source)}` : '/api/admin/stream-k-optimization';
+  eventSourceRef.current = new EventSource(streamUrl);
     
     // Timeout di sicurezza (15 minuti)
     timeoutRef.current = setTimeout(() => {
@@ -354,6 +372,22 @@ const MLUnifiedDashboard = ({ user }) => {
     };
   };
 
+  // Train per sorgente e aggiornamento raccomandazioni locali
+  const handleTrainForSource = async (source) => {
+    try {
+      addLog(`🚀 Avvio training (${source.toUpperCase()})...`, 'info');
+      await trainModel(source);
+      addLog(`✅ Training ${source.toUpperCase()} completato`, 'success');
+
+      // Dopo training, recupera raccomandazioni per l'utente e memorizza localmente
+      const recs = await fetchRecommendations(user.id, 10, source).catch(e => []);
+      if (source === 'tmdb') setRecsTmdb(recs);
+      else setRecsOmdb(recs);
+    } catch (e) {
+      addLog(`❌ Errore training ${source}: ${e.message || e}`, 'error');
+    }
+  };
+
   const handleStreamData = (data) => {
     switch (data.type) {
       case 'status':
@@ -361,30 +395,30 @@ const MLUnifiedDashboard = ({ user }) => {
         if (!data.message.includes('Nuovo K-SVD migliore') && !data.message.includes('K-SVD') && !data.message.includes('score')) {
           addLog(`📊 ${data.message}`, 'info');
         }
-        if (data.progress) setKOptimizationProgress(data.progress);
+        if (data.progress) setKOptimizationProgress(data.progress, data.source);
         break;
         
       case 'matrix_info':
-        setMatrixInfo(data);
-        addLog(`📈 Matrice: ${data.shape[0]}×${data.shape[1]} (densità: ${(data.density * 100).toFixed(2)}%)`, 'info');
+  setMatrixInfo(data, data.source);
+  addLog(`📈 Matrice: ${data.shape[0]}×${data.shape[1]} (densità: ${(data.density * 100).toFixed(2)}%)`, 'info');
         break;
         
       case 'phase':
-        setKOptimizationPhase(data.phase);
-        addLog(`🎯 ${data.message}`, 'phase');
-        if (data.progress) setKOptimizationProgress(data.progress);
+  setKOptimizationPhase(data.phase, data.source);
+  addLog(`🎯 ${data.message}`, 'phase');
+  if (data.progress) setKOptimizationProgress(data.progress, data.source);
         break;
         
       case 'k_svd_result':
-        addKSvdResult(data);
-        // 🔧 FIX: Nessun log durante i test, solo risultato finale
-        setKOptimizationProgress(data.progress);
+  addKSvdResult(data, data.source);
+  // 🔧 FIX: Nessun log durante i test, solo risultato finale
+  setKOptimizationProgress(data.progress, data.source);
         break;
         
       case 'k_cluster_result':
-        addKClusterResult(data);
-        // 🔧 FIX: Nessun log durante i test, solo risultato finale
-        setKOptimizationProgress(data.progress);
+  addKClusterResult(data, data.source);
+  // 🔧 FIX: Nessun log durante i test, solo risultato finale
+  setKOptimizationProgress(data.progress, data.source);
         break;
         
       case 'k_svd_winner_update':
@@ -411,12 +445,15 @@ const MLUnifiedDashboard = ({ user }) => {
             }
           });
         }, 100);
-        addLog(`🏆 EVIDENZIATO K-Cluster vincitore: K=${data.k} (Score: ${data.composite_score?.toFixed(4)})`, 'success');
+  // Proteggi contro valori undefined
+  const kVal = (data && (data.k !== undefined && data.k !== null)) ? data.k : 'N/A';
+  const scoreVal = (data && data.composite_score !== undefined && data.composite_score !== null) ? Number(data.composite_score).toFixed(4) : 'N/A';
+  addLog(`🏆 EVIDENZIATO K-Cluster vincitore: K=${kVal} (Score: ${scoreVal})`, 'success');
         break;
 
       case 'k_svd_optimal':
-        console.log('K-SVD Optimal received:', data);
-        setOptimalResults(prev => ({ ...prev, k_svd: data.optimal_k, svd_score: data.score }));
+  console.log('K-SVD Optimal received:', data);
+  setOptimalResults({ k_svd: data.optimal_k, svd_score: data.score }, data.source);
         if (data.note) {
           addLog(`🎯 K-SVD SUGGERITO: ${data.optimal_k} (${data.note})`, 'info');
         } else {
@@ -429,7 +466,7 @@ const MLUnifiedDashboard = ({ user }) => {
         
       case 'k_cluster_optimal':
         console.log('K-Cluster Optimal received:', data);
-        setOptimalResults(prev => ({ ...prev, k_cluster: data.optimal_k, cluster_score: data.score }));
+  setOptimalResults({ k_cluster: data.optimal_k, cluster_score: data.score }, data.source);
         addLog(`🏆 K-Cluster OTTIMALE: ${data.optimal_k}`, 'success');
         
         // 🔧 FIX: Evidenzia il vincitore aggiungendo un risultato con is_best: true
@@ -441,23 +478,29 @@ const MLUnifiedDashboard = ({ user }) => {
           composite_score: data.score,
           is_best: true,
           progress: 90
-        });
+        }, data.source);
         console.log('Current optimalResults after cluster update:', { ...kOptimization.optimalResults, k_cluster: data.optimal_k });
         break;
         
       case 'completed':
         addLog(`🎉 ${data.message}`, 'success');
         addLog(`📊 Risultati finali: K-SVD=${data.final_k_svd}, K-Cluster=${data.final_k_cluster}`, 'success');
-        setKOptimizationProgress(100);
+        setKOptimizationProgress(100, data.source);
         
         // 🔧 FIX: Forza refresh stato ML e aggiorna dashboard principale
         console.log('🔄 Forzando refresh stato ML dopo ottimizzazione...');
         console.log('Current optimal results:', kOptimization.optimalResults);
         setTimeout(async () => {
           try {
-            await fetchModelStatus();
+            // Aggiorna lo stato della sorgente ottimizzata (se presente) oppure entrambi
+            if (data.source) {
+              await fetchModelStatus(data.source);
+            } else {
+              await fetchModelStatus('tmdb');
+              await fetchModelStatus('omdb');
+            }
             console.log('✅ Stato ML aggiornato dopo ottimizzazione');
-            
+
             // Force re-render del dashboard
             window.dispatchEvent(new Event('optimizationCompleted'));
           } catch (error) {
@@ -525,21 +568,22 @@ const MLUnifiedDashboard = ({ user }) => {
             Controlli Principali ML
           </SectionTitle>
           <ButtonGroup>
+            {/* Global train removed: use per-source Train TMDB / Train OMDb buttons below */}
             <Button 
-              onClick={trainModel} 
-              disabled={isTraining || loading}
-              variant="success"
-            >
-              <FaRocket />
-              {isTraining ? 'Training...' : 'Addestra Modello'}
-            </Button>
-            <Button 
-              onClick={handleKOptimization} 
-              disabled={kOptimization.isOptimizing}
+              onClick={() => handleKOptimization('tmdb')} 
+              disabled={kOptimizationBySource?.tmdb?.isOptimizing}
               variant="warning"
             >
               <FaCogs />
-              {kOptimization.isOptimizing ? 'Ottimizzando...' : 'Ottimizza K'}
+              {kOptimizationBySource?.tmdb?.isOptimizing ? 'Ottimizzando TMDB...' : 'Ottimizza TMDB'}
+            </Button>
+            <Button 
+              onClick={() => handleKOptimization('omdb')} 
+              disabled={kOptimizationBySource?.omdb?.isOptimizing}
+              variant="warning"
+            >
+              <FaCogs />
+              {kOptimizationBySource?.omdb?.isOptimizing ? 'Ottimizzando OMDb...' : 'Ottimizza OMDb'}
             </Button>
             {kOptimization.isOptimizing && (
               <Button onClick={handleStopKOptimization} variant="danger">
@@ -547,17 +591,7 @@ const MLUnifiedDashboard = ({ user }) => {
                 Ferma
               </Button>
             )}
-            <Button 
-              onClick={() => setAutoRefresh(!isAutoRefresh)}
-              variant={isAutoRefresh ? 'success' : 'secondary'}
-            >
-              <FaSync />
-              Auto-refresh {isAutoRefresh ? 'ON' : 'OFF'}
-            </Button>
-            <Button onClick={clearLogs} variant="secondary">
-              <FaTrash />
-              Pulisci Log
-            </Button>
+            {/* Auto-refresh and clear log controls removed as requested */}
           </ButtonGroup>
         </SectionHeader>
 
@@ -565,30 +599,49 @@ const MLUnifiedDashboard = ({ user }) => {
         <StatusGrid>
           <MetricCard>
             <MetricValue>
-              <StatusBadge isReady={modelStatus?.is_trained}>
-                {modelStatus?.is_trained ? '✅ ATTIVO' : '❌ INATTIVO'}
+              <StatusBadge isReady={modelStatusBySource?.tmdb?.is_trained}>
+                {modelStatusBySource?.tmdb?.is_trained ? '✅ TMDB' : '❌ TMDB'}
               </StatusBadge>
             </MetricValue>
-            <MetricLabel>Stato Modello</MetricLabel>
+            <MetricLabel>Stato TMDB</MetricLabel>
           </MetricCard>
 
           <MetricCard>
             <MetricValue>
-              {modelStatus?.n_components || 'N/A'}
+              {modelStatusBySource?.tmdb?.n_components || 'N/A'}
             </MetricValue>
-            <MetricLabel>K-SVD Attuale</MetricLabel>
+            <MetricLabel>K-SVD (TMDB)</MetricLabel>
           </MetricCard>
 
           <MetricCard>
             <MetricValue>
-              {modelStatus?.explained_variance 
-                ? `${(modelStatus.explained_variance * 100).toFixed(1)}%`
-                : 'N/A'}
+              {modelStatusBySource?.tmdb?.explained_variance ? `${(modelStatusBySource.tmdb.explained_variance * 100).toFixed(1)}%` : 'N/A'}
             </MetricValue>
-            <MetricLabel>Varianza Spiegata</MetricLabel>
+            <MetricLabel>Varianza (TMDB)</MetricLabel>
           </MetricCard>
 
-          {/* 🔧 FIX: Rimossi K-SVD Ottimale e K-Cluster Ottimale perché mostravano sempre N/A */}
+          <MetricCard>
+            <MetricValue>
+              <StatusBadge isReady={modelStatusBySource?.omdb?.is_trained}>
+                {modelStatusBySource?.omdb?.is_trained ? '✅ OMDb' : '❌ OMDb'}
+              </StatusBadge>
+            </MetricValue>
+            <MetricLabel>Stato OMDb</MetricLabel>
+          </MetricCard>
+
+          <MetricCard>
+            <MetricValue>
+              {modelStatusBySource?.omdb?.n_components || 'N/A'}
+            </MetricValue>
+            <MetricLabel>K-SVD (OMDb)</MetricLabel>
+          </MetricCard>
+
+          <MetricCard>
+            <MetricValue>
+              {modelStatusBySource?.omdb?.explained_variance ? `${(modelStatusBySource.omdb.explained_variance * 100).toFixed(1)}%` : 'N/A'}
+            </MetricValue>
+            <MetricLabel>Varianza (OMDb)</MetricLabel>
+          </MetricCard>
         </StatusGrid>
 
         {/* Progress Bar K-Optimization */}
@@ -608,38 +661,34 @@ const MLUnifiedDashboard = ({ user }) => {
       </FullWidthSection>
 
       <SectionGrid>
-        {/* Sezione Raccomandazioni */}
+        {/* Sezione Raccomandazioni TMDB */}
         <Section>
           <SectionHeader>
             <SectionTitle>
               <FaStar />
-              Raccomandazioni
+              Raccomandazioni — TMDB
             </SectionTitle>
             <ButtonGroup>
               <Button 
-                onClick={() => fetchRecommendations(user.id)}
-                disabled={loading || !modelStatus?.is_trained}
+                onClick={() => handleTrainForSource('tmdb')}
+                disabled={loading || isTraining}
+                variant="success"
               >
-                <FaPlay />
-                Genera
+                <FaRocket />
+                Train TMDB
               </Button>
-              <Button onClick={() => fetchUserHistory(user.id)} disabled={loading}>
-                <FaHistory />
-                Storico
-              </Button>
+              {/* Genera and Storico removed for TMDB (handled by Train/auto display) */}
             </ButtonGroup>
           </SectionHeader>
-          
-          {recommendations.length > 0 && (
+
+          {(recsTmdb.length > 0) ? (
             <div style={{ maxHeight: '500px', overflowY: 'auto' }}>
-              {recommendations.slice(0, 10).map((movie, index) => (
-                <MovieCard key={index}>
+              {recsTmdb.slice(0, 10).map((movie, index) => (
+                <MovieCard key={`tmdb-${index}`}>
                   <MoviePoster 
                     src={getTMDBImageUrl(movie.poster_url)} 
                     alt={movie.title}
-                    onError={(e) => {
-                      e.target.src = getTMDBImageUrl(null);
-                    }}
+                    onError={(e) => { e.target.src = getTMDBImageUrl(null); }}
                   />
                   <MovieInfo>
                     <MovieTitle>{movie.title}</MovieTitle>
@@ -651,50 +700,134 @@ const MLUnifiedDashboard = ({ user }) => {
                 </MovieCard>
               ))}
             </div>
+          ) : (
+            <div style={{ color: '#666' }}>Nessuna raccomandazione TMDB caricata. Esegui 'Train TMDB' o 'Genera'.</div>
           )}
         </Section>
 
-        {/* Sezione Valutazione */}
+        {/* Sezione Raccomandazioni OMDb */}
+        <Section>
+          <SectionHeader>
+            <SectionTitle>
+              <FaStar />
+              Raccomandazioni — OMDb
+            </SectionTitle>
+            <ButtonGroup>
+              <Button 
+                onClick={() => handleTrainForSource('omdb')}
+                disabled={loading || isTraining}
+                variant="success"
+              >
+                <FaRocket />
+                Train OMDb
+              </Button>
+              {/* Genera and Storico removed for OMDb (handled by Train/auto display) */}
+            </ButtonGroup>
+          </SectionHeader>
+
+          {(recsOmdb.length > 0) ? (
+            <div style={{ maxHeight: '500px', overflowY: 'auto' }}>
+              {recsOmdb.slice(0, 10).map((movie, index) => (
+                <MovieCard key={`omdb-${index}`}>
+                  <MoviePoster 
+                    src={getTMDBImageUrl(movie.poster_url)} 
+                    alt={movie.title}
+                    onError={(e) => { e.target.src = getTMDBImageUrl(null); }}
+                  />
+                  <MovieInfo>
+                    <MovieTitle>{movie.title}</MovieTitle>
+                    <MovieRating>
+                      <FaStar />
+                      {movie.predicted_rating.toFixed(2)} (previsto)
+                    </MovieRating>
+                  </MovieInfo>
+                </MovieCard>
+              ))}
+            </div>
+          ) : (
+            <div style={{ color: '#666' }}>Nessuna raccomandazione OMDb caricata. Esegui 'Train OMDb' o 'Genera'.</div>
+          )}
+        </Section>
+
+        {/* Sezione Valutazione — rimane condivisa */}
         <Section>
           <SectionHeader>
             <SectionTitle>
               <FaChartLine />
               Performance
             </SectionTitle>
-            <ButtonGroup>
-              <Button 
-                onClick={fetchEvaluation}
-                disabled={loading || !modelStatus?.is_trained}
-              >
-                <FaChartLine />
-                Valuta
-              </Button>
-              <Button 
-                onClick={fetchClustering}
-                disabled={loading || !modelStatus?.is_trained}
-              >
-                <FaBrain />
-                Clustering
-              </Button>
-            </ButtonGroup>
+              <ButtonGroup style={{ flexWrap: 'nowrap', overflowX: 'auto' }}>
+                <Button 
+                  onClick={async () => {
+                    const evalTm = await fetchEvaluation('tmdb').catch(() => null);
+                    setEvaluationTmdb(evalTm);
+                  }}
+                  disabled={loading || !modelStatusBySource?.tmdb?.is_trained}
+                >
+                  <FaChartLine />
+                  Valuta TMDB
+                </Button>
+                <Button 
+                  onClick={async () => {
+                    const evalOm = await fetchEvaluation('omdb').catch(() => null);
+                    setEvaluationOmdb(evalOm);
+                  }}
+                  disabled={loading || !modelStatusBySource?.omdb?.is_trained}
+                >
+                  <FaChartLine />
+                  Valuta OMDb
+                </Button>
+                <Button 
+                  onClick={async () => {
+                    const clTm = await fetchClustering('tmdb').catch(() => null);
+                    setClusteringTmdb(clTm);
+                  }}
+                  disabled={loading || !modelStatusBySource?.tmdb?.is_trained}
+                >
+                  <FaBrain />
+                  Clustering TMDB
+                </Button>
+                <Button 
+                  onClick={async () => {
+                    const clOm = await fetchClustering('omdb').catch(() => null);
+                    setClusteringOmdb(clOm);
+                  }}
+                  disabled={loading || !modelStatusBySource?.omdb?.is_trained}
+                >
+                  <FaBrain />
+                  Clustering OMDb
+                </Button>
+              </ButtonGroup>
           </SectionHeader>
           
-          {evaluation && !evaluation.error && (
-            <StatusGrid>
-              <MetricCard>
-                <MetricValue>{evaluation.rmse?.toFixed(4) || 'N/A'}</MetricValue>
-                <MetricLabel>RMSE</MetricLabel>
-              </MetricCard>
-              <MetricCard>
-                <MetricValue>{evaluation.mae?.toFixed(4) || 'N/A'}</MetricValue>
-                <MetricLabel>MAE</MetricLabel>
-              </MetricCard>
-            </StatusGrid>
-          )}
+          {/* Valutazioni (disposte su una singola riga per confronto) */}
+          <div style={{ display: 'flex', gap: theme.spacing.md, alignItems: 'stretch', marginBottom: theme.spacing.lg }}>
+            <MetricCard style={{ flex: 1, textAlign: 'center' }}>
+              <MetricValue>{evaluationTmdb && evaluationTmdb.rmse ? evaluationTmdb.rmse.toFixed(4) : 'N/A'}</MetricValue>
+              <MetricLabel>RMSE (TMDB)</MetricLabel>
+              {evaluationTmdb && evaluationTmdb.error && <div style={{ marginTop: 6, color: '#c0392b', fontSize: 12 }}>{evaluationTmdb.error}</div>}
+            </MetricCard>
+
+            <MetricCard style={{ flex: 1, textAlign: 'center' }}>
+              <MetricValue>{evaluationTmdb && evaluationTmdb.mae ? evaluationTmdb.mae.toFixed(4) : 'N/A'}</MetricValue>
+              <MetricLabel>MAE (TMDB)</MetricLabel>
+            </MetricCard>
+
+            <MetricCard style={{ flex: 1, textAlign: 'center' }}>
+              <MetricValue>{evaluationOmdb && evaluationOmdb.rmse ? evaluationOmdb.rmse.toFixed(4) : 'N/A'}</MetricValue>
+              <MetricLabel>RMSE (OMDb)</MetricLabel>
+              {evaluationOmdb && evaluationOmdb.error && <div style={{ marginTop: 6, color: '#c0392b', fontSize: 12 }}>{evaluationOmdb.error}</div>}
+            </MetricCard>
+
+            <MetricCard style={{ flex: 1, textAlign: 'center' }}>
+              <MetricValue>{evaluationOmdb && evaluationOmdb.mae ? evaluationOmdb.mae.toFixed(4) : 'N/A'}</MetricValue>
+              <MetricLabel>MAE (OMDb)</MetricLabel>
+            </MetricCard>
+          </div>
 
           {/* Grafico Clustering */}
-          {clustering && !clustering.error ? (
-            <div style={{ marginTop: '20px' }}>
+          {( (clusteringTmdb && !clusteringTmdb.error) || (clusteringOmdb && !clusteringOmdb.error) ) ? (
+              <div style={{ marginTop: '20px' }}>
               <div style={{ 
                 padding: '10px', 
                 backgroundColor: '#e3f2fd', 
@@ -703,11 +836,40 @@ const MLUnifiedDashboard = ({ user }) => {
                 fontSize: '14px',
                 color: '#1565c0'
               }}>
-                💡 <strong>Clustering Test Set:</strong> Mostra solo i film votati dagli utenti AFlix, 
-                raggruppati nello spazio delle caratteristiche SVD per scoprire pattern di preferenze.
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <div>
+                    💡 <strong>Clustering Test Set:</strong> Mostra solo i film votati dagli utenti AFlix, 
+                    raggruppati nello spazio delle caratteristiche SVD per scoprire pattern di preferenze.
+                  </div>
+                  <div>
+                    <Button onClick={() => setShowClusterFullscreen(true)} variant="success">🔍 Full Screen</Button>
+                  </div>
+                </div>
               </div>
-              <div style={{ height: '450px' }}>
-                <ClusteringChart data={clustering} />
+
+              {/* Side-by-side charts: TMDB | OMDb */}
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: theme.spacing.xl, height: '560px' }}>
+                <div style={{ background: 'white', padding: '10px', borderRadius: '6px' }}>
+                  <h4 style={{ margin: '6px 0 12px 0' }}>Clustering — TMDB</h4>
+                  <div style={{ height: '500px' }}>
+                    {clusteringTmdb && !clusteringTmdb.error ? (
+                      <ClusteringChart data={clusteringTmdb} />
+                    ) : (
+                      <div style={{ color: '#666' }}>Nessun clustering TMDB disponibile.</div>
+                    )}
+                  </div>
+                </div>
+
+                <div style={{ background: 'white', padding: '10px', borderRadius: '6px' }}>
+                  <h4 style={{ margin: '6px 0 12px 0' }}>Clustering — OMDb</h4>
+                  <div style={{ height: '500px' }}>
+                    {clusteringOmdb && !clusteringOmdb.error ? (
+                      <ClusteringChart data={clusteringOmdb} />
+                    ) : (
+                      <div style={{ color: '#666' }}>Nessun clustering OMDb disponibile.</div>
+                    )}
+                  </div>
+                </div>
               </div>
             </div>
           ) : (
@@ -719,15 +881,39 @@ const MLUnifiedDashboard = ({ user }) => {
               backgroundColor: '#f8f9fa',
               borderRadius: '8px'
             }}>
-              {clustering?.error ? (
-                <div>❌ Errore nel caricamento clustering: {clustering.error}</div>
-              ) : (
-                <div>📊 Nessun dato di clustering disponibile. Clicca "Mostra Clustering" per generarlo.</div>
-              )}
+              <div>📊 Nessun dato di clustering disponibile. Clicca "Clustering TMDB" o "Clustering OMDb" per generarlo.</div>
             </div>
           )}
         </Section>
       </SectionGrid>
+
+      {/* Fullscreen modal for clustering */}
+      {showClusterFullscreen && (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.8)', zIndex: 2000, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          <div style={{ width: '95vw', height: '95vh', background: '#fff', borderRadius: 8, padding: 16, overflow: 'auto' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+              <h3 style={{ margin: 0 }}>Clustering — Fullscreen</h3>
+              <div>
+                <Button onClick={() => setShowClusterFullscreen(false)} variant="danger">Chiudi</Button>
+              </div>
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20, height: 'calc(100% - 56px)' }}>
+              <div style={{ background: 'white', padding: 10, borderRadius: 6 }}>
+                <h4>Clustering — TMDB</h4>
+                <div style={{ height: '85%' }}>
+                  {clusteringTmdb && !clusteringTmdb.error ? <ClusteringChart data={clusteringTmdb} /> : <div style={{ color: '#666' }}>Nessun clustering TMDB disponibile.</div>}
+                </div>
+              </div>
+              <div style={{ background: 'white', padding: 10, borderRadius: 6 }}>
+                <h4>Clustering — OMDb</h4>
+                <div style={{ height: '85%' }}>
+                  {clusteringOmdb && !clusteringOmdb.error ? <ClusteringChart data={clusteringOmdb} /> : <div style={{ color: '#666' }}>Nessun clustering OMDb disponibile.</div>}
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Sezione Risultati K-Optimization */}
       {(kOptimization.kSvdResults.length > 0 || kOptimization.kClusterResults.length > 0) && (

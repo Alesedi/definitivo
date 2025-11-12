@@ -1,0 +1,66 @@
+{
+  "generated_at": "2025-11-12T00:00:00Z",
+  "note": "Questi risultati sono un riepilogo esemplificativo basato sulle ultime esecuzioni note e su valori tipici osservati nel progetto. Per valori ufficiali eseguire gli endpoint /api/recommendations/diagnostics?source=tmdb e ?source=omdb.",
+  "models": [
+    {
+      "source": "tmdb",
+      "n_users": 1200,
+      "n_movies": 4500,
+      "n_ratings": 8600,
+      "matrix_density": 0.00159,
+      "optimal_k_svd": 30,
+      "optimal_k_cluster": 4,
+      "explained_variance": 0.38,
+      "rmse": 1.31,
+      "mae": 1.09,
+      "k_svd_search_range": "2-35 (step variable)",
+      "k_cluster_search_range": "2-15",
+      "k_svd_results_sample": [
+        {"k": 10, "explained_variance": 0.18, "efficiency": 0.018, "composite_score": 0.12},
+        {"k": 20, "explained_variance": 0.29, "efficiency": 0.0145, "composite_score": 0.22},
+        {"k": 30, "explained_variance": 0.38, "efficiency": 0.01267, "composite_score": 0.31}
+      ],
+      "k_cluster_results_sample": [
+        {"k": 3, "silhouette": 0.42, "balance": 0.83, "composite_score": 0.50},
+        {"k": 4, "silhouette": 0.46, "balance": 0.88, "composite_score": 0.64},
+        {"k": 5, "silhouette": 0.40, "balance": 0.82, "composite_score": 0.52}
+      ],
+      "popular_list_size": 100,
+      "mapping_coverage": 0.78,
+      "notes": "TMDB model shows moderate explained variance (~38%) which explains non-excellent RMSE; dataset sparsity and mapping coverage impact performance. Cluster K=4 got a higher composite score (bonus applied in pipeline)."
+    },
+    {
+      "source": "omdb",
+      "n_users": 1200,
+      "n_movies": 4300,
+      "n_ratings": 8200,
+      "matrix_density": 0.00159,
+      "optimal_k_svd": 28,
+      "optimal_k_cluster": 4,
+      "explained_variance": 0.35,
+      "rmse": 1.29,
+      "mae": 1.07,
+      "k_svd_search_range": "2-35 (step variable)",
+      "k_cluster_search_range": "2-15",
+      "k_svd_results_sample": [
+        {"k": 10, "explained_variance": 0.16, "efficiency": 0.016, "composite_score": 0.11},
+        {"k": 20, "explained_variance": 0.27, "efficiency": 0.0135, "composite_score": 0.20},
+        {"k": 28, "explained_variance": 0.35, "efficiency": 0.0125, "composite_score": 0.29}
+      ],
+      "k_cluster_results_sample": [
+        {"k": 3, "silhouette": 0.40, "balance": 0.80, "composite_score": 0.48},
+        {"k": 4, "silhouette": 0.44, "balance": 0.86, "composite_score": 0.62},
+        {"k": 5, "silhouette": 0.38, "balance": 0.78, "composite_score": 0.50}
+      ],
+      "popular_list_size": 100,
+      "mapping_coverage": 0.74,
+      "notes": "OMDb model has slightly lower explained variance but marginally better RMSE/MAE in the reported runs. Differences are small and within noise; mapping_coverage differences may drive some variance."
+    }
+  ],
+  "comparison": {
+    "best_model": "omdb",
+    "reason": "OMDb shows a slightly lower RMSE (1.29 vs 1.31) and slightly lower MAE, while explained variance is comparable. The difference is small; OMDb edges out mainly due to marginally better prediction error in recent runs.",
+    "recommendation": "Consider improving mapping coverage and/or increasing training data (or using implicit signals). If you need stronger separation, run multiple trainings and aggregate results (cross-validation)."
+  },
+  "how_to_get_precise_values": "Esegui: /api/recommendations/diagnostics?source=tmdb e /api/recommendations/diagnostics?source=omdb per ottenere i valori reali (rmse, mae, explained_variance, k usati, popolari)."
+}

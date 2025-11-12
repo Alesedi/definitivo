@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import styled from 'styled-components';
 import { Container, Section, Title, Subtitle, Text, Button, Grid, LoadingSpinner, Flex, Badge } from '../styles/components';
 import MovieCard from '../components/MovieCard';
@@ -65,96 +65,20 @@ const RecommendationsHeader = styled(Flex)`
 const DashboardPage = ({ user }) => {
   const [recommendations, setRecommendations] = useState([]);
   const [userStats, setUserStats] = useState(null);
+  const [mlSource, setMlSource] = useState('tmdb');
+  const [evaluation, setEvaluation] = useState(null);
+  const [clusteringData, setClusteringData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
 
-  useEffect(() => {
-    fetchData();
-  }, []);
-
-  const fetchData = async () => {
+  const fetchData = useCallback(async () => {
     try {
-      // Prova prima a ottenere raccomandazioni ML
-      let recommendations = [];
-      let userStats = {};
-      
-      try {
-        // Controlla stato del modello ML
-        const modelStatus = await recommendationsAPI.getModelStatus();
-        
-        if (modelStatus.data.is_trained) {
-          // Usa raccomandazioni ML se il modello è addestrato
-          const mlRecsResponse = await recommendationsAPI.getRecommendations(user.id, 20);
-          recommendations = mlRecsResponse.data.map(rec => ({
-            id: rec.tmdb_id,
-            title: rec.title,
-            genres: rec.genres.join('|'), // Converti da array a stringa per compatibilità
-            poster_path: rec.poster_url ? rec.poster_url.replace('https://image.tmdb.org/t/p/w500', '') : null,
-            vote_average: rec.tmdb_rating || 0,
-            popularity: rec.predicted_rating * 20, // Scala il rating predetto
-            recommendation_score: rec.predicted_rating
-          }));
-        } else {
-          // Fallback su raccomandazioni popolari
-          const popularResponse = await recommendationsAPI.getPopularRecommendations(20);
-          recommendations = popularResponse.data.map(rec => ({
-            id: rec.tmdb_id,
-            title: rec.title,
-            genres: rec.genres.join('|'),
-            poster_path: rec.poster_url ? rec.poster_url.replace('https://image.tmdb.org/t/p/w500', '') : null,
-            vote_average: rec.tmdb_rating || 0,
-            popularity: rec.predicted_rating * 20,
-            recommendation_score: rec.predicted_rating
-          }));
-        }
-        
-        // Ottieni storico utente per statistiche
-        const historyResponse = await recommendationsAPI.getUserHistory(user.id);
-        userStats = {
-          total_votes: historyResponse.data.length,
-          average_rating: historyResponse.data.length > 0 
-            ? historyResponse.data.reduce((sum, item) => sum + item.rating, 0) / historyResponse.data.length 
-            : 0,
-          declared_preferences: user.generi_preferiti || []
-        };
-        
-      } catch (mlError) {
-        console.warn('ML endpoints not available, usando fallback:', mlError);
-        // Fallback: crea dati fittizi per evitare errori
-        recommendations = [];
-        userStats = {
-          total_votes: 0,
-          average_rating: 0,
-          declared_preferences: user.generi_preferiti || []
-        };
-      }
-      
-      setRecommendations(recommendations);
-      setUserStats(userStats);
-      
-    } catch (error) {
-      console.error('Error fetching data:', error);
-      // Imposta valori di default in caso di errore
-      setRecommendations([]);
-      setUserStats({
-        total_votes: 0,
-        average_rating: 0,
-        declared_preferences: user.generi_preferiti || []
-      });
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const handleRefresh = async () => {
-    setRefreshing(true);
-    try {
-      // Prova prima le raccomandazioni ML
-      const modelStatus = await recommendationsAPI.getModelStatus();
+      // Prova prima a ottenere raccomandazioni ML per la sorgente selezionata
+      const modelStatus = await recommendationsAPI.getModelStatus(mlSource);
       
       let recommendations = [];
       if (modelStatus.data.is_trained) {
-        const mlRecsResponse = await recommendationsAPI.getRecommendations(user.id, 20);
+        const mlRecsResponse = await recommendationsAPI.getRecommendations(user.id, 20, mlSource);
         recommendations = mlRecsResponse.data.map(rec => ({
           id: rec.tmdb_id,
           title: rec.title,
@@ -176,7 +100,97 @@ const DashboardPage = ({ user }) => {
           recommendation_score: rec.predicted_rating
         }));
       }
+
+      // Ottieni storico utente per statistiche
+      const historyResponse = await recommendationsAPI.getUserHistory(user.id);
+      const userStatsLocal = {
+        total_votes: historyResponse.data.length,
+        average_rating: historyResponse.data.length > 0 
+          ? historyResponse.data.reduce((sum, item) => sum + item.rating, 0) / historyResponse.data.length 
+          : 0,
+        declared_preferences: user.generi_preferiti || []
+      };
+
+      // Prova a ottenere evaluation e clustering per la sorgente selezionata
+      try {
+        const evalResp = await recommendationsAPI.getEvaluation(mlSource);
+        setEvaluation(evalResp.data);
+      } catch (e) {
+        setEvaluation(null);
+      }
+
+      try {
+        const clustResp = await recommendationsAPI.getClustering(mlSource);
+        setClusteringData(clustResp.data);
+      } catch (e) {
+        setClusteringData(null);
+      }
+
+      setRecommendations(recommendations);
+      setUserStats(userStatsLocal);
+
+    } catch (mlError) {
+      console.warn('ML endpoints not available, usando fallback:', mlError);
+      // Fallback: crea dati fittizi per evitare errori
+      setRecommendations([]);
+      setUserStats({
+        total_votes: 0,
+        average_rating: 0,
+        declared_preferences: user.generi_preferiti || []
+      });
+      setEvaluation(null);
+      setClusteringData(null);
+    } finally {
+      setLoading(false);
+    }
+  }, [mlSource, user.id]);
+
+  useEffect(() => {
+    fetchData();
+  }, [fetchData]);
+
+  const handleRefresh = async () => {
+    setRefreshing(true);
+    try {
+      // Prova prima le raccomandazioni ML per la sorgente selezionata
+      const modelStatus = await recommendationsAPI.getModelStatus(mlSource);
       
+      let recommendations = [];
+      if (modelStatus.data.is_trained) {
+        const mlRecsResponse = await recommendationsAPI.getRecommendations(user.id, 20, mlSource);
+        recommendations = mlRecsResponse.data.map(rec => ({
+          id: rec.tmdb_id,
+          title: rec.title,
+          genres: rec.genres.join('|'),
+          poster_path: rec.poster_url ? rec.poster_url.replace('https://image.tmdb.org/t/p/w500', '') : null,
+          vote_average: rec.tmdb_rating || 0,
+          popularity: rec.predicted_rating * 20,
+          recommendation_score: rec.predicted_rating
+        }));
+      } else {
+        const popularResponse = await recommendationsAPI.getPopularRecommendations(20);
+        recommendations = popularResponse.data.map(rec => ({
+          id: rec.tmdb_id,
+          title: rec.title,
+          genres: rec.genres.join('|'),
+          poster_path: rec.poster_url ? rec.poster_url.replace('https://image.tmdb.org/t/p/w500', '') : null,
+          vote_average: rec.tmdb_rating || 0,
+          popularity: rec.predicted_rating * 20,
+          recommendation_score: rec.predicted_rating
+        }));
+      }
+
+      // Anche qui aggiorniamo evaluation/clustering
+      try {
+        const evalResp = await recommendationsAPI.getEvaluation(mlSource);
+        setEvaluation(evalResp.data);
+      } catch (e) { setEvaluation(null); }
+
+      try {
+        const clustResp = await recommendationsAPI.getClustering(mlSource);
+        setClusteringData(clustResp.data);
+      } catch (e) { setClusteringData(null); }
+
       setRecommendations(recommendations);
     } catch (error) {
       console.error('Error refreshing recommendations:', error);
@@ -279,6 +293,11 @@ const DashboardPage = ({ user }) => {
           <RecommendationsHeader>
             <div>
               <Subtitle>I tuoi film consigliati</Subtitle>
+              <div style={{ marginTop: '6px' }}>
+                <Button variant={mlSource === 'tmdb' ? 'primary' : 'secondary'} onClick={() => setMlSource('tmdb')} style={{ marginRight: '8px' }}>TMDB</Button>
+                <Button variant={mlSource === 'omdb' ? 'primary' : 'secondary'} onClick={() => setMlSource('omdb')}>OMDb</Button>
+                <Text style={{ display: 'inline-block', marginLeft: '12px', color: '#666' }}>Sorgente: {mlSource.toUpperCase()}</Text>
+              </div>
               <Text style={{ marginTop: '0.5rem' }}>
                 Basati sui tuoi generi preferiti e voti precedenti
               </Text>
@@ -301,6 +320,30 @@ const DashboardPage = ({ user }) => {
               ))}
             </FilterSection>
           )}
+
+          {/* Brief evaluation/clustering summary for selected source */}
+          <div style={{ marginTop: '1rem', marginBottom: '1rem' }}>
+            {evaluation ? (
+              <div style={{ color: '#333', marginBottom: '0.5rem' }}>
+                <strong>Evaluation ({mlSource.toUpperCase()}):</strong>
+                <span style={{ marginLeft: '8px' }}>RMSE: {evaluation.rmse ?? 'N/A'}</span>
+                <span style={{ marginLeft: '12px' }}>MAE: {evaluation.mae ?? 'N/A'}</span>
+                <span style={{ marginLeft: '12px' }}>Samples: {evaluation.test_samples ?? '-'}</span>
+              </div>
+            ) : (
+              <div style={{ color: '#888', marginBottom: '0.5rem' }}>Nessuna valutazione disponibile per {mlSource.toUpperCase()}</div>
+            )}
+
+            {clusteringData ? (
+              <div style={{ color: '#333' }}>
+                <strong>Clustering ({mlSource.toUpperCase()}):</strong>
+                <span style={{ marginLeft: '8px' }}>Clusters: {clusteringData.n_clusters ?? 'N/A'}</span>
+                <span style={{ marginLeft: '12px' }}>Total AFIX movies: {clusteringData.total_aflix_movies ?? '-'}</span>
+              </div>
+            ) : (
+              <div style={{ color: '#888' }}>Nessun dato di clustering disponibile per {mlSource.toUpperCase()}</div>
+            )}
+          </div>
 
           {recommendations.length > 0 ? (
             <Grid>

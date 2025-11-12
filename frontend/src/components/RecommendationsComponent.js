@@ -335,10 +335,7 @@ const RecommendationsComponent = ({ user }) => {
             <SectionTitle>Le Tue Raccomandazioni</SectionTitle>
           </SectionHeader>
           
-          <Button onClick={fetchRecommendations} disabled={loading || !modelStatus?.is_trained}>
-            <FaPlay />
-            Genera Raccomandazioni
-          </Button>
+          {/* Genera Raccomandazioni removed per richiesta (usare Train/automatic display) */}
 
           {recommendations.length > 0 && (
             <div style={{ marginTop: '20px' }}>
@@ -375,10 +372,7 @@ const RecommendationsComponent = ({ user }) => {
             <SectionTitle>Il Tuo Storico</SectionTitle>
           </SectionHeader>
           
-          <Button onClick={fetchUserHistory} disabled={loading}>
-            <FaChartLine />
-            Visualizza Storico Voti
-          </Button>
+          {/* Visualizza Storico Voti removed per richiesta */}
 
           {userHistory.length > 0 && (
             <div style={{ marginTop: '20px' }}>

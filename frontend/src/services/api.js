@@ -42,13 +42,13 @@ export const ratingsAPI = {
 
 export const recommendationsAPI = {
   // Nuovi endpoint ML
-  getRecommendations: (userId, topN = 10) => api.get(`/api/recommendations/user/${userId}?top_n=${topN}`),
+  getRecommendations: (userId, topN = 10, source = 'tmdb') => api.get(`/api/recommendations/user/${userId}?top_n=${topN}&source=${source}`),
   getUserHistory: (userId) => api.get(`/api/recommendations/user/${userId}/history`),
-  getModelStatus: () => api.get('/api/recommendations/status'),
-  trainModel: () => api.get('/api/recommendations/train-sync'),
-  trainModelAsync: () => api.post('/api/recommendations/train'),
-  getEvaluation: () => api.get('/api/recommendations/evaluation'),
-  getClustering: () => api.get('/api/recommendations/clustering'),
+  getModelStatus: (source = 'tmdb') => api.get(`/api/recommendations/status?source=${source}`),
+  trainModel: (source = 'tmdb') => api.get(`/api/recommendations/train-sync?source=${source}`),
+  trainModelAsync: (source = 'tmdb') => api.post(`/api/recommendations/train?source=${source}`),
+  getEvaluation: (source = 'tmdb') => api.get(`/api/recommendations/evaluation?source=${source}`),
+  getClustering: (source = 'tmdb') => api.get(`/api/recommendations/clustering?source=${source}`),
   getPopularRecommendations: (topN = 10) => api.get(`/api/recommendations/popular?top_n=${topN}`),
   
   // Backward compatibility (deprecated)

@@ -17,6 +17,8 @@ from modelli_ODM.voto_odm import Votazione
 from modelli_ODM.film_odm import Film
 from modelli_ODM.utente_odm import Utente
 import logging
+from service.service_omdb import omdb_service
+import difflib
 
 logger = logging.getLogger(__name__)
 
@@ -48,21 +50,43 @@ class MLRecommendationService:
         self.variance_per_component = []  # Varianza spiegata per ogni componente
         self.optimal_k = None  # Valore k ottimale identificato
         self.k_performance_log = {}  # Log performance per diversi k
-        
+        # Instance name (set after creation)
+        self.instance_name = 'unknown'
+
         # TMDB Integration - API key corretta
         self.tmdb_api_key = os.getenv('TMDB_API_KEY', '9e6c375b125d733d9ce459bdd91d4a06')
         self.tmdb_base_url = "https://api.themoviedb.org/3"
         self.tmdb_cache_dir = "data/tmdb_cache"
         self.use_tmdb_training = True
+        # OMDb Integration
+        self.omdb_api_key = os.getenv('OMDB_API_KEY', '2639fb0f')
+        self.use_omdb_training = False
+        self.omdb_cache_dir = "data/omdb_cache"
         self.tmdb_movies_df = None
         self.tmdb_ratings_df = None
         self.training_source = "hybrid"
         self.cache_dir = "data/cache"
         self.current_k_factor = 25  # ✅ Allineato con n_components
-        
+        # Cached per-service popular recommendations (built from last synthetic dataset)
+        self._service_popular_recommendations = []
+        self.last_trained_at = None
+
+        # Placeholder poster used when no poster can be resolved for a title
+        # Use a small, reliable placeholder image — change if you have a local asset
+        self.default_poster_placeholder = "https://via.placeholder.com/500x750?text=No+Poster"
+
         # TMDB API per poster
         self.TMDB_API_KEY = "9e6c375b125d733d9ce459bdd91d4a06"
         self.TMDB_BASE_URL = "https://api.themoviedb.org/3/movie/{}/images?api_key={}"
+
+        # Mappatura nomi generi -> TMDB id (usata per generazione sintetica OMDb)
+        self.genre_name_to_id = {
+            'Action': 28, 'Adventure': 12, 'Animation': 16, 'Comedy': 35,
+            'Crime': 80, 'Documentary': 99, 'Drama': 18, 'Family': 10751,
+            'Fantasy': 14, 'History': 36, 'Horror': 27, 'Music': 10402,
+            'Mystery': 9648, 'Romance': 10749, 'Science Fiction': 878,
+            'TV Movie': 10770, 'Thriller': 53, 'War': 10752, 'Western': 37
+        }
 
     def fetch_poster_url(self, tmdb_id: int) -> Optional[str]:
         """Recupera URL poster da TMDB API"""
@@ -111,88 +135,137 @@ class MLRecommendationService:
     def train_model(self) -> Dict[str, Any]:
         """Addestra il modello SVD e clustering con supporto TMDB"""
         try:
-            logger.info("🚀 INIZIO TRAINING MODELLO ML")
+            logger.info(f"INIZIO TRAINING MODELLO ML (instance={getattr(self, 'instance_name', 'unknown')})")
             logger.info("=" * 80)
             
             # Decide fonte dati per training
-            if self.use_tmdb_training and self.tmdb_api_key:
-                logger.info("🎬 Modalità HYBRID: Training su TMDB + Testing su AFlix")
-                return self._train_hybrid_model()
+            if self.use_omdb_training and self.omdb_api_key:
+                logger.info("Modalità HYBRID-OMDB: Training su OMDb + Testing su AFlix")
+                return self._train_hybrid_model(source='omdb')
+            elif self.use_tmdb_training and self.tmdb_api_key:
+                logger.info("Modalità HYBRID: Training su TMDB + Testing su AFlix")
+                return self._train_hybrid_model(source='tmdb')
+            
             else:
-                logger.info("🏠 Modalità AFlix-only: Training su dati AFlix")
-                return self._train_aflix_only_model()
+                logger.info("Modalità AFlix-only: Training su dati AFlix")
+                result = self._train_aflix_only_model()
+                # set last trained timestamp
+                try:
+                    self.last_trained_at = datetime.now().isoformat()
+                except Exception:
+                    pass
+                return result
                 
         except Exception as e:
-            logger.error(f"❌ Errore training modello: {e}")
+            logger.error(f"Errore training modello: {e}")
             raise
     
-    def _train_hybrid_model(self) -> Dict[str, Any]:
-        """Training ibrido: TMDB per training, AFlix per testing"""
+    def _train_hybrid_model(self, source: str = 'tmdb') -> Dict[str, Any]:
+        """Training ibrido: usa TMDB o OMDb per training, AFlix per testing
+
+        Args:
+            source: 'tmdb' or 'omdb'
+        """
         
         try:
             # 0. FORZA RESET PARAMETRI K ALL'INIZIO
-            logger.info("🔄 Reset parametri K per training ibrido...")
+            logger.info(f"Reset parametri K per training ibrido... (instance={getattr(self,'instance_name','unknown')} source={source})")
             self.n_components = 25
             self.current_k_factor = 25
-            logger.info(f"✅ Parametri K forzati: n_components={self.n_components}, current_k_factor={self.current_k_factor}")
+            logger.info(f"Parametri K forzati: n_components={self.n_components}, current_k_factor={self.current_k_factor}")
             
-            # 1. Genera o carica dataset TMDB
-            logger.info("🔄 Inizio generazione/caricamento dati TMDB...")
-            tmdb_data = self._get_or_generate_tmdb_data()
-            logger.info(f"✅ Dataset TMDB caricato: {len(tmdb_data)} rating, {tmdb_data['userId'].nunique() if len(tmdb_data) > 0 else 0} utenti, {tmdb_data['title'].nunique() if len(tmdb_data) > 0 else 0} film")
-            
+            # 1. Genera o carica dataset (TMDB o OMDb)
+            if source == 'omdb':
+                logger.info("Inizio generazione/caricamento dati OMDb...")
+                tmdb_data = self._get_or_generate_omdb_data()
+            else:
+                logger.info("Inizio generazione/caricamento dati TMDB...")
+                tmdb_data = self._get_or_generate_tmdb_data()
+
+            # Save last training dataframe for diagnostics / popular-building
+            try:
+                self._last_training_df = tmdb_data.copy() if hasattr(tmdb_data, 'copy') else tmdb_data
+            except Exception:
+                self._last_training_df = tmdb_data
+
+            logger.info(f"Dataset caricato: {len(tmdb_data)} rating, {tmdb_data['userId'].nunique() if len(tmdb_data) > 0 else 0} utenti, {tmdb_data['title'].nunique() if len(tmdb_data) > 0 else 0} film")
+
             if len(tmdb_data) == 0:
-                logger.error("❌ Dataset TMDB vuoto! Fallback ad AFlix-only")
+                logger.error("Dataset di training vuoto! Fallback ad AFlix-only")
                 return self._train_aflix_only_model()
             
             # 2. Training SVD su dati TMDB
-            logger.info("🧠 Training SVD su dataset TMDB...")
+            logger.info("Training SVD su dataset TMDB...")
             ratings_matrix = self._create_ratings_matrix(tmdb_data)
-            logger.info(f"📊 Matrice rating creata: {ratings_matrix.shape}")
+            logger.info(f"Matrice rating creata: {ratings_matrix.shape}")
             
             # 3. AUTO-OTTIMIZZAZIONE K su dataset TMDB (se abilitata)
             if self.auto_optimize_k_svd or self.auto_optimize_k_cluster:
-                logger.info("🎯 Avvio ottimizzazione K-values su dataset TMDB...")
+                logger.info("Avvio ottimizzazione K-values su dataset TMDB...")
                 optimization_results = self.optimize_both_k_values(ratings_matrix)
-                logger.info(f"✅ Ottimizzazione completata: {optimization_results}")
+                logger.info(f"Ottimizzazione completata: {optimization_results}")
             
             # 4. Applica SVD con K ottimizzato
-            logger.info("🔧 Applicando decomposizione SVD...")
+            logger.info("Applicando decomposizione SVD...")
             self._apply_svd_to_matrix(ratings_matrix)
-            logger.info(f"✅ SVD completata con k_factor: {self.current_k_factor}")
+            logger.info(f"SVD completata con k_factor: {self.current_k_factor}")
             
         except Exception as e:
-            logger.error(f"❌ Errore nel training hybrid: {e}")
-            logger.info("🔄 Fallback a modalità AFlix-only...")
+            logger.error(f"Errore nel training hybrid: {e}")
+            logger.info("Fallback a modalità AFlix-only...")
             return self._train_aflix_only_model()
-        
+
         # 4. Test su dati AFlix se disponibili
         aflix_performance = self._test_on_aflix_data()
-        
+
         # 5. CLUSTERING SUI FILM AFLIX (non TMDB!)
         self._apply_clustering_on_aflix_movies()
-        
+
         # 6. Salva numero di rating per status
         self._training_ratings_count = len(tmdb_data)
-        
-        # 7. Statistiche finali
-        stats = self._compile_hybrid_stats(tmdb_data, aflix_performance)
-        
+        # 7. Imposta training_source sull'istanza PRIMA di compilare le statistiche
+        self.training_source = f"hybrid_{'omdb' if source == 'omdb' else 'tmdb'}_train_aflix_test"
+
+        # 8. Statistiche finali
+        stats = self._compile_hybrid_stats(tmdb_data, aflix_performance, source)
+
         self.is_trained = True
-        self.training_source = "hybrid_tmdb_train_aflix_test"
-        
+        try:
+            self.last_trained_at = datetime.now().isoformat()
+        except Exception:
+            pass
+
+        # FORZATURA: costruisci esplicitamente la lista "popular" per questa istanza
+        # usando il DataFrame di training salvato. Questo evita che entrambe le
+        # istanze ricadano nel fallback globale del DB e assicura differenze
+        # tra TMDB e OMDb nella lista di fallback.
+        try:
+            df = getattr(self, '_last_training_df', None)
+            if df is not None and len(df) > 0:
+                built = self._build_service_popular_from_df(df, source=source, top_n=100)
+                if built and len(built) > 0:
+                    try:
+                        self._service_popular_recommendations = built
+                    except Exception:
+                        # ignore assignment errors
+                        pass
+        except Exception as e:
+            logger.debug(f"Could not force-build service popular list at training end: {e}")
+
+        logger.info(f"Model training completed for instance={getattr(self,'instance_name','unknown')} source={source} - stats: {stats}")
+
         return stats
 
     def _train_aflix_only_model(self) -> Dict[str, Any]:
         """Training tradizionale solo su dati AFlix"""
         try:
             # Prepara i dati AFlix
-            logger.info("📊 Preparando dati AFlix...")
+            logger.info("Preparando dati AFlix...")
             df = self.prepare_data()
-            logger.info(f"✅ Dati AFlix preparati: {len(df)} rating, {df['userId'].nunique() if len(df) > 0 else 0} utenti, {df['title'].nunique() if len(df) > 0 else 0} film")
+            logger.info(f"Dati AFlix preparati: {len(df)} rating, {df['userId'].nunique() if len(df) > 0 else 0} utenti, {df['title'].nunique() if len(df) > 0 else 0} film")
             
             if len(df) < 10:
-                logger.warning("⚠️ Dataset AFlix troppo piccolo, uso dati demo TMDB...")
+                logger.warning("Dataset AFlix troppo piccolo, uso dati demo TMDB...")
                 return self._train_demo_tmdb_model()
             
             # Encoding utenti e film
@@ -411,7 +484,222 @@ class MLRecommendationService:
             pickle.dump(tmdb_ratings, f)
         
         logger.info(f"✅ Dataset TMDB generato e salvato: {len(tmdb_ratings)} rating")
+        # Costruisci lista "popolare" per questa istanza (usata come fallback per raccomandazioni)
+        try:
+            self._service_popular_recommendations = self._build_service_popular_from_movies(popular_movies, tmdb_ratings)
+        except Exception as e:
+            logger.debug(f"Impossibile costruire popular recommendations TMDB: {e}")
+
+        # Salva mappatura titolo -> generi per fallback genre-based
+        try:
+            movie_genre_map = {}
+            for m in popular_movies:
+                title = m.get('title') or m.get('name')
+                genre_ids = m.get('genre_ids') or m.get('genre_ids', []) or []
+                # some seeds may have Genre names rather than ids
+                if not genre_ids and m.get('genre_ids') is None and m.get('genres'):
+                    # try to use 'genres' text if present
+                    if isinstance(m.get('genres'), list):
+                        genre_ids = m.get('genres')
+                movie_genre_map[title] = genre_ids
+            self.train_movie_genres = movie_genre_map
+        except Exception:
+            self.train_movie_genres = {}
         return tmdb_ratings
+
+    # ================================
+    # 🚩 CSV support
+    # ================================
+    # CSV support removed: training from local MovieLens CSVs (ml-latest) was reverted per user request.
+    # Previous implementation included load_csv and _train_from_csv to allow training from a directory
+    # containing ratings.csv and movies.csv. That code was removed to restore the previous behavior
+    # where training uses either TMDB/OMDb synthetic datasets or the internal AFlix DB.
+
+    def _get_or_generate_omdb_data(self) -> pd.DataFrame:
+        """Ottiene o genera dataset usando metadata OMDb (proxy: usa lista film TMDB e risolve su OMDb)"""
+
+        cache_file = os.path.join(self.cache_dir, 'omdb_training_data.pkl')
+
+        # Usa cache se disponibile e recente (7 giorni)
+        if os.path.exists(cache_file):
+            mod_time = os.path.getmtime(cache_file)
+            if (datetime.now().timestamp() - mod_time) < 7 * 24 * 3600:
+                logger.info("📂 Caricamento dataset OMDb da cache...")
+                with open(cache_file, 'rb') as f:
+                    return pickle.load(f)
+
+        logger.info("🔄 Generazione nuovo dataset OMDb usando OMDb metadata (via TMDB seed)...")
+
+        # Recupera una combinazione di seed TMDB (top_rated, now_playing, discover anni) per OMDb
+        seeds = []
+        try:
+            seeds.extend(self._fetch_tmdb_top_rated_movies(pages=10))
+        except Exception as e:
+            logger.debug(f"Errore fetching top_rated seed: {e}")
+        try:
+            seeds.extend(self._fetch_tmdb_now_playing(pages=6))
+        except Exception as e:
+            logger.debug(f"Errore fetching now_playing seed: {e}")
+
+        # Discover con anni diversi per variare i titoli
+        try:
+            seeds.extend(self._fetch_tmdb_discover_by_years(years=list(range(1990, 2001)), per_year=3))
+            seeds.extend(self._fetch_tmdb_discover_by_years(years=list(range(2005, 2011)), per_year=3))
+        except Exception as e:
+            logger.debug(f"Errore fetching discover seeds: {e}")
+
+        # Dedupe per titolo
+        seen = set()
+        popular_movies = []
+        for m in seeds:
+            title = m.get('title') or m.get('name')
+            if not title:
+                continue
+            if title in seen:
+                continue
+            seen.add(title)
+            popular_movies.append(m)
+
+        # Se la lista è enorme, taglia
+        if len(popular_movies) > 800:
+            popular_movies = popular_movies[:800]
+
+        # Escludi i titoli che compaiono nel seed TMDB (popular) per mantenere i dataset disgiunti
+        try:
+            tmdb_popular = self._fetch_tmdb_popular_movies(pages=20)
+            tmdb_titles = {m.get('title') or m.get('name') for m in tmdb_popular if m}
+            before = len(popular_movies)
+            popular_movies = [m for m in popular_movies if (m.get('title') or m.get('name')) not in tmdb_titles]
+            after = len(popular_movies)
+            logger.info(f"🔎 Esclusi {before - after} seed OMDb presenti anche in TMDB popular - rimangono {after} seed OMDb")
+        except Exception as e:
+            logger.debug(f"Errore durante l'esclusione dei titoli TMDB dal seed OMDb: {e}")
+
+        logger.info(f"🔎 Film seed combinati recuperati da TMDb per OMDb: {len(popular_movies)}")
+
+        if len(popular_movies) == 0:
+            logger.error("❌ Nessun film seed per OMDb generation")
+            return pd.DataFrame()
+
+        omdb_movies = []
+        for m in popular_movies:
+            title = m.get('title') or m.get('name')
+            year = None
+            try:
+                # Prova a estrarre l'anno se disponibile
+                release = m.get('release_date') or m.get('first_air_date')
+                if release:
+                    year = release.split('-')[0]
+            except:
+                year = None
+
+            try:
+                # Preferisci ricerca via imdbID se disponibile
+                imdb_id = m.get('imdb_id')
+                omdb_data = None
+                if imdb_id:
+                    omdb_data = omdb_service.get_movie_by_imdb(imdb_id)
+                if not omdb_data and title:
+                    omdb_data = omdb_service.search_movie(title, year=year)
+
+                if not omdb_data:
+                    continue
+
+                # Mappa campi OMDb in struttura simile a TMDB
+                genres_text = omdb_data.get('Genre', '') if isinstance(omdb_data, dict) else ''
+                genre_names = [g.strip() for g in genres_text.split(',')] if genres_text else []
+                # Converti nomi generi in TMDB ids se possibile
+                genre_ids = [self.genre_name_to_id.get(name) for name in genre_names if self.genre_name_to_id.get(name)]
+
+                vote_average = 0.0
+                try:
+                    vote_average = float(omdb_data.get('imdbRating')) if omdb_data.get('imdbRating') and omdb_data.get('imdbRating') != 'N/A' else 5.0
+                except:
+                    vote_average = 5.0
+
+                omdb_movies.append({
+                    'id': omdb_data.get('imdbID') or m.get('id'),
+                    'title': omdb_data.get('Title') or title,
+                    'genre_ids': genre_ids,
+                    'vote_average': vote_average,
+                    'popularity': m.get('popularity', 0),
+                    'raw_omdb': omdb_data
+                })
+
+                # Rate limit leggero
+                import time
+                time.sleep(0.05)
+
+            except Exception as e:
+                logger.debug(f"Errore resolving OMDb per film '{title}': {e}")
+                continue
+
+        logger.info(f"✅ Film OMDb risolti: {len(omdb_movies)}")
+
+        if len(omdb_movies) == 0:
+            logger.error("❌ Nessun metadata OMDb ottenuto, abort")
+            return pd.DataFrame()
+
+        # Genera rating sintetici usando logica OMDb (seed diverso, profili diversi)
+        logger.info("🤖 Generando rating sintetici (OMDb)...")
+        # Indichiamo al generatore che stiamo creando dataset OMDb
+        try:
+            self._current_generation_is_omdb = True
+            omdb_ratings = self._generate_synthetic_ratings(omdb_movies, n_users=15000)
+
+            # Aplicare una leggera perturbazione ai rating OMDb per variare i fattori latenti
+            try:
+                if isinstance(omdb_ratings, pd.DataFrame) and len(omdb_ratings) > 0:
+                    # Per i film meno popolari, aggiungi un bias positivo; per i popolari un bias leggermente negativo
+                    def apply_bias(row):
+                        pop = float(row.get('popularity', 0) or 0)
+                        base = float(row.get('rating', 3.0) or 3.0)
+                        bias = 0.0
+                        if pop < 20:
+                            bias += 0.25
+                        elif pop > 60:
+                            bias -= 0.15
+                        # Aggiungi rumore gaussiano
+                        bias += float(np.random.normal(0, 0.2))
+                        newr = max(0.5, min(5.0, round((base + bias) * 2) / 2))
+                        return newr
+
+                    omdb_ratings['rating'] = omdb_ratings.apply(apply_bias, axis=1)
+                    logger.info(f"🔧 Applied per-movie bias to OMDb synthetic ratings (samples: {min(20, len(omdb_ratings))})")
+            except Exception as e:
+                logger.debug(f"Errore applicazione bias su OMDb ratings: {e}")
+        finally:
+            # cleanup flag
+            if hasattr(self, '_current_generation_is_omdb'):
+                delattr(self, '_current_generation_is_omdb')
+
+        if len(omdb_ratings) == 0:
+            logger.error("❌ Generazione rating sintetici OMDb fallita!")
+            return pd.DataFrame()
+
+        # Salva in cache
+        os.makedirs(self.cache_dir, exist_ok=True)
+        with open(cache_file, 'wb') as f:
+            pickle.dump(omdb_ratings, f)
+
+        logger.info(f"✅ Dataset OMDb generato e salvato: {len(omdb_ratings)} rating")
+        # Costruisci lista "popolare" basata sui movie seed OMDb
+        try:
+            # Passiamo la lista omdb_movies (contiene raw_omdb) e il dataframe omdb_ratings
+            self._service_popular_recommendations = self._build_service_popular_from_movies(omdb_movies, omdb_ratings, is_omdb=True)
+        except Exception as e:
+            logger.debug(f"Impossibile costruire popular recommendations OMDb: {e}")
+        # Salva mappatura titolo -> generi per fallback genre-based
+        try:
+            movie_genre_map = {}
+            for m in omdb_movies:
+                title = m.get('title') or m.get('name')
+                genre_ids = m.get('genre_ids') or []
+                movie_genre_map[title] = genre_ids
+            self.train_movie_genres = movie_genre_map
+        except Exception:
+            self.train_movie_genres = {}
+        return omdb_ratings
     
     def _fetch_tmdb_popular_movies(self, pages: int = 10) -> List[Dict]:
         """Recupera film popolari da TMDB API"""
@@ -455,63 +743,179 @@ class MLRecommendationService:
         
         logger.info(f"📥 Recuperati {len(movies)} film da TMDB")
         return movies
+
+    def _fetch_tmdb_top_rated_movies(self, pages: int = 10) -> List[Dict]:
+        """Recupera film top-rated da TMDB API (usato come seed alternativo per OMDb)"""
+        import requests
+
+        if not self.tmdb_api_key or self.tmdb_api_key == "YOUR_API_KEY":
+            logger.error("❌ TMDB API key non configurata!")
+            return []
+
+        movies = []
+        for page in range(1, pages + 1):
+            try:
+                url = f"{self.tmdb_base_url}/movie/top_rated"
+                params = {
+                    'api_key': self.tmdb_api_key,
+                    'page': page,
+                    'language': 'it-IT'
+                }
+                response = requests.get(url, params=params, timeout=10)
+                response.raise_for_status()
+                data = response.json()
+                page_results = data.get('results', [])
+                movies.extend(page_results)
+                import time
+                time.sleep(0.1)
+            except Exception as e:
+                logger.error(f"❌ Errore fetch top-rated pagina {page}: {e}")
+                break
+
+        logger.info(f"📥 Recuperati {len(movies)} top-rated film da TMDB")
+        return movies
+
+    def _fetch_tmdb_now_playing(self, pages: int = 5) -> List[Dict]:
+        """Recupera film now_playing da TMDB API"""
+        import requests
+
+        if not self.tmdb_api_key or self.tmdb_api_key == "YOUR_API_KEY":
+            logger.error("❌ TMDB API key non configurata!")
+            return []
+
+        movies = []
+        for page in range(1, pages + 1):
+            try:
+                url = f"{self.tmdb_base_url}/movie/now_playing"
+                params = {'api_key': self.tmdb_api_key, 'page': page, 'language': 'it-IT'}
+                response = requests.get(url, params=params, timeout=10)
+                response.raise_for_status()
+                data = response.json()
+                movies.extend(data.get('results', []))
+                import time; time.sleep(0.1)
+            except Exception as e:
+                logger.debug(f"Errore fetch now_playing pagina {page}: {e}")
+                break
+
+        logger.info(f"📥 Recuperati {len(movies)} now_playing film da TMDB")
+        return movies
+
+    def _fetch_tmdb_discover_by_years(self, years: List[int], per_year: int = 2) -> List[Dict]:
+        """Usa l'endpoint discover per prendere film di anni diversi (per_year pagine per anno)"""
+        import requests
+
+        if not self.tmdb_api_key or self.tmdb_api_key == "YOUR_API_KEY":
+            logger.error("❌ TMDB API key non configurata!")
+            return []
+
+        movies = []
+        for year in years:
+            for page in range(1, per_year + 1):
+                try:
+                    url = f"{self.tmdb_base_url}/discover/movie"
+                    params = {
+                        'api_key': self.tmdb_api_key,
+                        'primary_release_year': year,
+                        'sort_by': 'vote_average.desc',
+                        'vote_count.gte': 10,
+                        'page': page,
+                        'language': 'it-IT'
+                    }
+                    response = requests.get(url, params=params, timeout=10)
+                    response.raise_for_status()
+                    data = response.json()
+                    movies.extend(data.get('results', []))
+                    import time; time.sleep(0.08)
+                except Exception as e:
+                    logger.debug(f"Errore discover year {year} page {page}: {e}")
+                    break
+
+        logger.info(f"📥 Recuperati {len(movies)} discover-film da TMDB per years={years[:3]}...")
+        return movies
     
     def _generate_synthetic_ratings(self, movies: List[Dict], n_users: int = 10000) -> pd.DataFrame:
         """Genera rating sintetici basati su caratteristiche TMDB"""
-        
         ratings_data = []
-        
-        # Simula diversi tipi di utenti con preferenze
-        user_profiles = self._create_user_profiles(n_users)
-        
+
+        # Se is_omdb è passato via attributo temporaneo in self (non ideal), supportalo
+        is_omdb = getattr(self, '_current_generation_is_omdb', False)
+
+        # Se OMDb, usa seed diverso per generazione (temporaneo - ripristiniamo lo stato RNG)
+        prev_state = None
+        if is_omdb:
+            try:
+                prev_state = np.random.get_state()
+                np.random.seed(4242)
+            except Exception:
+                prev_state = None
+
+        # Simula diversi tipi di utenti con preferenze (diverso per OMDb se richiesto)
+        user_profiles = self._create_user_profiles(n_users, is_omdb=is_omdb)
+
         for user_id in range(n_users):
             profile = user_profiles[user_id]
-            
+
             # Ogni utente valuta 10-50 film casualmente
             n_ratings = np.random.randint(10, 51)
             user_movies = np.random.choice(len(movies), size=min(n_ratings, len(movies)), replace=False)
-            
+
             for movie_idx in user_movies:
                 movie = movies[movie_idx]
-                
+
                 # Genera rating basato su profilo utente e caratteristiche film
                 rating = self._calculate_synthetic_rating(profile, movie)
-                
+
+                user_prefix = 'omdb' if is_omdb else 'tmdb'
                 ratings_data.append({
-                    'userId': f"tmdb_user_{user_id}",
+                    'userId': f"{user_prefix}_user_{user_id}",
                     'movieId': movie['id'],
-                    'title': movie['title'],
+                    'title': movie.get('title') or movie.get('name'),
                     'rating': rating,
                     'timestamp': datetime.now().timestamp(),
                     'genres': movie.get('genre_ids', []),
-                    'tmdb_rating': movie.get('vote_average', 5.0),
+                    'tmdb_rating': movie.get('vote_average', 5.0) if movie.get('vote_average') is not None else movie.get('vote_average', 5.0),
                     'popularity': movie.get('popularity', 0)
                 })
-        
+
+        # Ripristina stato RNG precedente
+        if prev_state is not None:
+            try:
+                np.random.set_state(prev_state)
+            except Exception:
+                pass
+
         df = pd.DataFrame(ratings_data)
-        logger.info(f"🎯 Generati {len(df)} rating sintetici per {n_users} utenti")
+        logger.info(f"🎯 Generati {len(df)} rating sintetici per {n_users} utenti (is_omdb={is_omdb})")
         return df
     
-    def _create_user_profiles(self, n_users: int) -> List[Dict]:
-        """Crea profili utente diversificati"""
+    def _create_user_profiles(self, n_users: int, is_omdb: bool = False) -> List[Dict]:
+        """Crea profili utente diversificati. Se is_omdb=True usa distribuzioni diverse per aumentare la variabilità."""
         profiles = []
-        
-        # Generi TMDB comuni
-        genres = [28, 12, 16, 35, 80, 99, 18, 10751, 14, 36, 27, 10402, 9648, 10749, 878, 10770, 53, 10752, 37]
-        
+
+        # Generi TMDB comuni (usati come id)
+        base_genres = [28, 12, 16, 35, 80, 99, 18, 10751, 14, 36, 27, 10402, 9648, 10749, 878, 10770, 53, 10752, 37]
+
         for _ in range(n_users):
-            # Preferenze casuali ma realistiche
-            favorite_genres = np.random.choice(genres, size=np.random.randint(2, 6), replace=False)
-            rating_tendency = np.random.normal(3.5, 0.8)  # Tendenza rating
-            rating_variance = np.random.uniform(0.5, 1.5)  # Variabilità rating
-            
+            if is_omdb:
+                # OMDb users: preferenze più varie e più rumorose
+                favorite_genres = np.random.choice(base_genres, size=np.random.randint(1, 7), replace=False)
+                rating_tendency = np.random.normal(3.2, 1.0)  # leggermente più variabile
+                rating_variance = np.random.uniform(0.6, 1.8)
+                popularity_bias = np.random.uniform(-0.7, 1.2)
+            else:
+                # TMDB users: più centrati
+                favorite_genres = np.random.choice(base_genres, size=np.random.randint(2, 6), replace=False)
+                rating_tendency = np.random.normal(3.5, 0.8)
+                rating_variance = np.random.uniform(0.5, 1.5)
+                popularity_bias = np.random.uniform(-0.5, 1.0)
+
             profiles.append({
                 'favorite_genres': favorite_genres.tolist(),
-                'rating_tendency': max(1.0, min(5.0, rating_tendency)),
-                'rating_variance': rating_variance,
-                'popularity_bias': np.random.uniform(-0.5, 1.0)  # Bias verso film popolari
+                'rating_tendency': float(max(1.0, min(5.0, rating_tendency))),
+                'rating_variance': float(rating_variance),
+                'popularity_bias': float(popularity_bias)
             })
-        
+
         return profiles
     
     def _calculate_synthetic_rating(self, profile: Dict, movie: Dict) -> float:
@@ -661,58 +1065,133 @@ class MLRecommendationService:
             if len(aflix_df) < 5:
                 return {"status": "insufficient_aflix_data", "rmse": None}
             
-            # Mappa film AFlix a TMDB (semplificato)
-            # In produzione, useresti fuzzy matching o mapping ID
-            common_movies = []
-            for title in aflix_df['title'].unique():
-                if title in self.movie_encoder.classes_:
-                    common_movies.append(title)
-            
-            if len(common_movies) < 3:
-                return {"status": "no_common_movies", "rmse": None}
-            
-            # Test su film in comune
-            test_data = aflix_df[aflix_df['title'].isin(common_movies)]
-            
-            # Predizioni
+            # Mappa film AFlix a TMDB con fallback fuzzy + genre-based
+            encoded_titles = list(self.movie_encoder.classes_)
+
+            def resolve_title_to_item_factor(aflix_title: str, aflix_genres: List[Any]):
+                """Ritorna un vettore item_factors per un titolo AFlix usando:
+                   1) match esatto
+                   2) fuzzy match (difflib)
+                   3) genre-overlap best match usando self.train_movie_genres
+                   4) weighted average dei top-k candidate
+                """
+                try:
+                    # 1) Exact match
+                    if aflix_title in self.movie_encoder.classes_:
+                        idx = int(self.movie_encoder.transform([aflix_title])[0])
+                        return self.item_factors[idx], 'exact'
+
+                    # 2) Fuzzy match
+                    matches = difflib.get_close_matches(aflix_title, encoded_titles, n=3, cutoff=0.7)
+                    if matches:
+                        # Usa il migliore
+                        best = matches[0]
+                        idx = int(self.movie_encoder.transform([best])[0])
+                        logger.debug(f"Fuzzy match: '{aflix_title}' -> '{best}'")
+                        return self.item_factors[idx], f'fuzzy:{best}'
+
+                    # 3) Genre-overlap: richiede mapping titolo->generi generato durante build dataset
+                    if hasattr(self, 'train_movie_genres') and self.train_movie_genres:
+                        # Calcola overlap con tutti i titoli noti (scorri solo i titoli con genres definiti)
+                        best_scores = []
+                        aflix_genre_set = set(aflix_genres) if aflix_genres else set()
+                        for cand in encoded_titles:
+                            cand_genres = set(self.train_movie_genres.get(cand, []))
+                            if not cand_genres:
+                                continue
+                            overlap = len(aflix_genre_set.intersection(cand_genres))
+                            if overlap > 0:
+                                best_scores.append((cand, overlap))
+
+                        if best_scores:
+                            # Ordina per overlap decrescente
+                            best_scores.sort(key=lambda x: x[1], reverse=True)
+                            top = [b[0] for b in best_scores[:3]]
+                            idxs = self.movie_encoder.transform(top)
+                            vecs = self.item_factors[idxs]
+                            weights = np.array([s for _, s in best_scores[:3]], dtype=float)
+                            weights /= weights.sum()
+                            return np.average(vecs, axis=0, weights=weights), f'genre_best:{top}'
+
+                    # 4) Ultimo fallback: media pesata dei primi N item_factors per similarità di titolo (partial)
+                    # Usa similarity via difflib.SequenceMatcher ratio su tutti i titoli
+                    ratios = []
+                    from difflib import SequenceMatcher
+                    for cand in encoded_titles:
+                        r = SequenceMatcher(None, aflix_title.lower(), cand.lower()).ratio()
+                        if r > 0.4:
+                            ratios.append((cand, r))
+                    if ratios:
+                        ratios.sort(key=lambda x: x[1], reverse=True)
+                        top = [r[0] for r in ratios[:5]]
+                        idxs = self.movie_encoder.transform(top)
+                        vecs = self.item_factors[idxs]
+                        weights = np.array([r[1] for r in ratios[:5]], dtype=float)
+                        weights /= weights.sum()
+                        return np.average(vecs, axis=0, weights=weights), f'partial_sim:{[t for t in top]}'
+
+                    # Se tutto fallisce, None
+                    return None, 'none'
+                except Exception as e:
+                    logger.debug(f"Errore resolving factor per '{aflix_title}': {e}")
+                    return None, 'error'
+
+            # Costruiamo test set e predizioni
             predictions = []
             actuals = []
-            
-            for _, row in test_data.iterrows():
+
+            mapping_counts = {}
+            for _, row in aflix_df.iterrows():
                 try:
-                    movie_idx = self.movie_encoder.transform([row['title']])[0]
-                    
-                    # Usa fattore utente medio (invece di singolo film)
+                    title = row['title']
+                    aflix_genres = row.get('genres', []) if isinstance(row.get('genres', []), list) else []
+                    item_vec, why = resolve_title_to_item_factor(title, aflix_genres)
+                    mapping_counts[why] = mapping_counts.get(why, 0) + 1
+                    if item_vec is None:
+                        # Non possiamo predire per questo film
+                        continue
+
+                    # Usa vettore utente medio se l'utente non è nel training
                     avg_user_factor = np.mean(self.user_factors, axis=0)
-                    pred_rating = np.dot(avg_user_factor, self.item_factors[movie_idx])
-                    
-                    # Aggiungi bias rating medio e clamp nel range [1, 5]
+                    pred_rating = float(np.dot(avg_user_factor, item_vec))
                     pred_rating += getattr(self, 'mean_rating_bias', 3.0)
                     pred_rating = max(1.0, min(5.0, pred_rating))
-                    
+
                     predictions.append(pred_rating)
                     actuals.append(row['rating'])
                 except Exception as e:
                     logger.debug(f"Errore predizione film {row.get('title', 'unknown')}: {e}")
                     continue
-            
+
+            try:
+                logger.info(f"AFlix->SVD mapping during evaluation: {mapping_counts}")
+            except Exception:
+                pass
+
             if len(predictions) > 0:
-                rmse = np.sqrt(mean_squared_error(actuals, predictions))
+                rmse = float(np.sqrt(mean_squared_error(actuals, predictions)))
+                mae = float(mean_absolute_error(actuals, predictions))
+                total_aflix = len(aflix_df)
+                coverage = float(len(predictions)) / total_aflix if total_aflix > 0 else None
                 return {
                     "status": "success",
                     "rmse": float(rmse),
+                    "mae": float(mae),
                     "test_samples": len(predictions),
-                    "common_movies": len(common_movies)
+                    "total_aflix_samples": total_aflix,
+                    "coverage": coverage,
+                    "mapping_counts": mapping_counts
                 }
-            
+
             return {"status": "no_predictions", "rmse": None}
             
         except Exception as e:
             logger.error(f"Errore test AFlix: {e}")
             return {"status": "error", "rmse": None, "error": str(e)}
     
-    def _compile_hybrid_stats(self, tmdb_data: pd.DataFrame, aflix_test: Dict) -> Dict:
-        """Compila statistiche training ibrido"""
+    def _compile_hybrid_stats(self, source_data: pd.DataFrame, aflix_test: Dict, source: str = 'tmdb') -> Dict:
+        """Compila statistiche training ibrido. Il campo dei dati di training sarà dinamico
+        (es. 'tmdb_data' o 'omdb_data') per evitare confusione quando la sorgente è OMDb."""
         
         # Calcola varianza spiegata se disponibile
         explained_variance = getattr(self, 'explained_variance', 0.0)
@@ -720,31 +1199,33 @@ class MLRecommendationService:
         
         logger.info(f"🔍 DEBUG HYBRID - actual_k_used: {actual_k_used}, explained_variance: {explained_variance}")
         
+        data_key = f"{source}_data" if source in ['tmdb', 'omdb'] else 'training_data'
+
         return {
             'status': 'success',
             'timestamp': datetime.now().isoformat(),
             'training_mode': 'hybrid',
             # Campi attesi dal frontend
             'stats': {
-                'total_ratings': len(tmdb_data),
+                'total_ratings': len(source_data),
                 'actual_k_used': int(actual_k_used) if actual_k_used and actual_k_used > 0 else None,
                 'explained_variance': float(explained_variance) if explained_variance else 0.0,
-                'unique_users': tmdb_data['userId'].nunique() if len(tmdb_data) > 0 else 0,
-                'unique_movies': tmdb_data['title'].nunique() if len(tmdb_data) > 0 else 0,
+                'unique_users': source_data['userId'].nunique() if len(source_data) > 0 else 0,
+                'unique_movies': source_data['title'].nunique() if len(source_data) > 0 else 0,
                 'test_rmse': aflix_test.get('rmse'),
                 'test_status': aflix_test.get('status')
             },
             'model_info': {
                 'algorithm': 'SVD',
                 'k_factor': self.current_k_factor,
-                'training_source': 'tmdb',
+                'training_source': getattr(self, 'training_source', 'tmdb'),
                 'test_source': 'aflix'
             },
-            'tmdb_data': {
-                'total_ratings': len(tmdb_data),
-                'unique_users': tmdb_data['userId'].nunique() if len(tmdb_data) > 0 else 0,
-                'unique_movies': tmdb_data['title'].nunique() if len(tmdb_data) > 0 else 0,
-                'rating_distribution': tmdb_data['rating'].value_counts().to_dict() if len(tmdb_data) > 0 else {}
+            data_key: {
+                'total_ratings': len(source_data),
+                'unique_users': source_data['userId'].nunique() if len(source_data) > 0 else 0,
+                'unique_movies': source_data['title'].nunique() if len(source_data) > 0 else 0,
+                'rating_distribution': source_data['rating'].value_counts().to_dict() if len(source_data) > 0 else {}
             },
             'aflix_test': aflix_test,
             'performance': {
@@ -1056,14 +1537,82 @@ class MLRecommendationService:
             raise ValueError("Model not trained. Call train_model() first.")
         
         try:
-            # Verifica che l'utente esista
-            if user_id not in self.user_encoder.classes_:
+            # Se l'utente è presente nel training encoder, usalo direttamente
+            inferred_user_vector = None
+            if user_id in self.user_encoder.classes_:
+                user_idx = self.user_encoder.transform([user_id])[0]
+                inferred_user_vector = self.user_factors[user_idx]
+            else:
+                # Proviamo a inferire un vettore utente dai voti reali AFlix
+                try:
+                    user_obj = Utente.objects(id=user_id).first()
+                    if user_obj:
+                        votes = list(Votazione.objects(utente=user_obj))
+                    else:
+                        votes = []
+                except Exception:
+                    votes = []
+
+                # Costruiamo vettore utente come media pesata dei fattori degli item votati
+                if votes:
+                    rated = []
+                    # Precompute encoded titles for fuzzy matching
+                    encoded_titles = list(self.movie_encoder.classes_) if hasattr(self, 'movie_encoder') and self.movie_encoder is not None else []
+                    from difflib import get_close_matches
+
+                    for v in votes:
+                        try:
+                            title = v.film.titolo
+                            rating_val = float(v.valutazione)
+                            if encoded_titles and title in encoded_titles:
+                                rated.append((title, rating_val))
+                            elif encoded_titles:
+                                # Proviamo fuzzy match per mappare titoli leggermente diversi
+                                matches = get_close_matches(title, encoded_titles, n=1, cutoff=0.6)
+                                if matches:
+                                    mapped = matches[0]
+                                    logger.info(f"User {user_id}: fuzzy-mapped voted title '{title}' -> '{mapped}' for inference")
+                                    rated.append((mapped, rating_val))
+                                else:
+                                    # Non trovato match; skip
+                                    logger.debug(f"User {user_id}: no match for voted title '{title}' during inference")
+                            else:
+                                # No movie encoder available yet
+                                logger.debug(f"User {user_id}: movie encoder not available, cannot map voted title '{title}'")
+                        except Exception:
+                            continue
+
+                    if rated:
+                        titles = [t for t, _ in rated]
+                        weights = np.array([r for _, r in rated], dtype=float)
+                        try:
+                            idxs = self.movie_encoder.transform(titles)
+                            item_vecs = self.item_factors[idxs]
+                            # Weighted average of item vectors
+                            inferred_user_vector = np.average(item_vecs, axis=0, weights=weights)
+                        except Exception as e:
+                            logger.debug(f"Could not infer user vector from AFlix votes: {e}")
+
+            # Debug logging: indicate how we inferred the user vector
+            if inferred_user_vector is None:
+                logger.info(f"User {user_id}: could not infer user vector from training encoders or AFlix votes - attempting item-nearest-neighbor fallback")
+                try:
+                    # Try item-based nearest-neighbor fallback using user's AFlix votes
+                    nn_recs = self._fallback_item_based_recommendations(user_id, top_n=top_n)
+                    if nn_recs and len(nn_recs) > 0:
+                        logger.info(f"User {user_id}: returning {len(nn_recs)} item-based fallback recommendations")
+                        return nn_recs
+                except Exception as e:
+                    logger.debug(f"Item-based fallback failed for user {user_id}: {e}")
+
+                # Ultimo fallback: raccomandazioni popolari
+                logger.info(f"User {user_id}: falling back to popular recommendations")
                 return self._get_popular_recommendations(top_n)
-            
-            user_idx = self.user_encoder.transform([user_id])[0]
-            
-            # Calcola rating predetti
-            predicted_ratings = np.dot(self.movie_factors, self.user_factors[user_idx])
+            else:
+                logger.info(f"User {user_id}: inferred user vector available (len={len(inferred_user_vector)}) - generating personalized recommendations")
+
+            # Calcola rating predetti usando il vettore utente (reale o inferito)
+            predicted_ratings = np.dot(self.movie_factors, inferred_user_vector)
             predicted_ratings = np.clip(predicted_ratings, 0.5, 5.0)
             
             # Converti in raccomandazioni
@@ -1114,27 +1663,31 @@ class MLRecommendationService:
     def _get_popular_recommendations(self, top_n: int) -> List[Dict[str, Any]]:
         """Raccomandazioni basate sulla popolarità per nuovi utenti"""
         try:
-            # Recupera film più votati dal database
+            # Se abbiamo costruito una lista popolare dal dataset di training (per-source), usala
+            if hasattr(self, '_service_popular_recommendations') and self._service_popular_recommendations:
+                return self._service_popular_recommendations[:top_n]
+
+            # Altrimenti recupera film più votati dal database (fallback globale)
             films = list(Film.objects.order_by('-media_voti', '-numero_voti')[:top_n])
-            
+
             recommendations = []
             for film in films:
                 # 🔧 FIX: Solo film con titolo valido
                 if not film.titolo or not film.titolo.strip() or film.titolo.strip().lower() in ['film raccomandato 1', 'no title', 'untitled']:
                     logger.debug(f"Saltato film popolare con titolo invalido: '{film.titolo}'")
                     continue
-                    
+
                 poster_url = None
                 if film.poster_path:
                     poster_url = f"https://image.tmdb.org/t/p/w500{film.poster_path}"
                 elif film.tmdb_id:
                     poster_url = self.fetch_poster_url(film.tmdb_id)
-                
+
                 # 🔧 FIX: Solo film con poster valido
                 if not poster_url or not poster_url.strip() or poster_url == 'None':
                     logger.debug(f"Saltato film popolare senza poster: '{film.titolo}' (poster: {poster_url})")
                     continue
-                
+
                 recommendations.append({
                     "title": film.titolo,
                     "predicted_rating": float(film.media_voti) if film.media_voti else 3.0,
@@ -1144,12 +1697,319 @@ class MLRecommendationService:
                     "tmdb_rating": film.tmdb_rating,
                     "cluster": 0
                 })
-            
+
             return recommendations
             
         except Exception as e:
             logger.error(f"Error generating popular recommendations: {e}")
             return []
+
+    def _build_service_popular_from_movies(self, movies: List[Dict], ratings_df: pd.DataFrame, is_omdb: bool = False) -> List[Dict[str, Any]]:
+        """Costruisce una lista di raccomandazioni popolari basata sul dataset di training generato.
+
+        movies: lista originale passata alla generazione dei rating (può contenere raw_omdb)
+        ratings_df: DataFrame generato con colonne 'title', 'rating', 'movieId'
+        is_omdb: flag per adattare estrazione poster
+        """
+        try:
+            if ratings_df is None or len(ratings_df) == 0:
+                return []
+
+            # Calcola media rating e conteggio per titolo
+            agg = ratings_df.groupby('title').agg({'rating': ['mean', 'count']})
+            agg.columns = ['mean_rating', 'count']
+            agg = agg.reset_index()
+            agg = agg.sort_values(by=['mean_rating', 'count'], ascending=[False, False])
+
+            # Costruisci mapping per poster dai movie seed
+            poster_map = {}
+            for m in movies:
+                title = m.get('title') or m.get('name')
+                if is_omdb:
+                    raw = m.get('raw_omdb') if isinstance(m, dict) else None
+                    poster = None
+                    if raw and isinstance(raw, dict):
+                        poster = raw.get('Poster')
+                    poster_map[title] = poster
+                else:
+                    poster = m.get('poster_path') or None
+                    # if poster is TMDB path, build full url
+                    if poster and poster.startswith('/'):
+                        poster_map[title] = f"https://image.tmdb.org/t/p/w500{poster}"
+                    else:
+                        poster_map[title] = poster
+
+            results = []
+            for _, row in agg.head(50).iterrows():
+                title = row['title']
+                poster = poster_map.get(title)
+                # If no poster, try to fetch via movieId (if numeric) else use placeholder
+                if not poster:
+                    try:
+                        movie_id = row.get('movieId') if 'movieId' in row.index else None
+                        if movie_id and str(movie_id).isdigit():
+                            poster = self.fetch_poster_url(int(movie_id))
+                    except Exception:
+                        poster = None
+
+                if not poster:
+                    poster = getattr(self, 'default_poster_placeholder', None)
+
+                results.append({
+                    'title': title,
+                    'predicted_rating': float(row['mean_rating']),
+                    'poster_url': poster,
+                    'genres': [],
+                    'tmdb_id': None,
+                    'tmdb_rating': None,
+                    'cluster': 0
+                })
+
+            return results
+        except Exception as e:
+            logger.debug(f"Errore building service popular: {e}")
+            return []
+
+    def _build_service_popular_from_df(self, df: pd.DataFrame, source: str = 'tmdb', top_n: int = 50) -> List[Dict[str, Any]]:
+        """Costruisce una lista 'popolare' direttamente dal DataFrame di training.
+
+        Questo metodo è più tollerante: non scarta i titoli senza poster, usa placeholder
+        quando necessario e prova a risolvere poster tramite DB Film se possibile.
+        Restituisce una lista ordinata per mean rating+count.
+        """
+        try:
+            if df is None or len(df) == 0:
+                return []
+
+            # Aggrega per titolo
+            agg = df.groupby('title').agg({'rating': ['mean', 'count']})
+            agg.columns = ['mean_rating', 'count']
+            agg = agg.reset_index()
+
+            # Score composito: mean_rating * log(1+count)
+            import numpy as _np
+            agg['score'] = agg['mean_rating'] * _np.log1p(agg['count'])
+            agg = agg.sort_values(by=['score', 'mean_rating', 'count'], ascending=[False, False, False])
+
+            results = []
+            placeholder = None
+            try:
+                # usa un placeholder locale se presente
+                placeholder = getattr(self, 'default_poster_placeholder', None)
+            except Exception:
+                placeholder = None
+
+            for _, row in agg.head(top_n).iterrows():
+                title = row['title']
+                poster_url = None
+
+                # 1) prova a trovare il poster tramite Film DB
+                try:
+                    film = Film.objects(titolo=title).first()
+                    if film:
+                        if film.poster_path:
+                            poster_url = f"https://image.tmdb.org/t/p/w500{film.poster_path}"
+                        elif film.tmdb_id:
+                            poster_url = self.fetch_poster_url(film.tmdb_id)
+                except Exception:
+                    poster_url = None
+
+                # 2) se non trovato, prova a usare poster salvati nel DataFrame (colonna 'poster' o 'poster_url')
+                if not poster_url:
+                    if 'poster' in df.columns:
+                        # cerca il primo valore non-null per questo titolo
+                        try:
+                            pv = df[df['title'] == title]['poster'].dropna()
+                            if len(pv) > 0:
+                                poster_url = pv.iloc[0]
+                        except Exception:
+                            poster_url = None
+
+                # 3) fallback a placeholder (se configurato)
+                if not poster_url:
+                    poster_url = placeholder
+
+                results.append({
+                    'title': title,
+                    'predicted_rating': float(row['mean_rating']),
+                    'poster_url': poster_url,
+                    'genres': [],
+                    'tmdb_id': None,
+                    'tmdb_rating': None,
+                    'cluster': 0
+                })
+
+            # cache per istanza
+            try:
+                self._service_popular_recommendations = results
+            except Exception:
+                pass
+
+            return results
+        except Exception as e:
+            logger.debug(f"Errore building service popular from df: {e}")
+            return []
+
+    def _fallback_item_based_recommendations(self, user_id: str, top_n: int = 10) -> List[Dict[str, Any]]:
+        """Fallback item-based: usa i film votati dall'utente per trovare vicini nel movie_factors e aggregare punteggi.
+
+        Questo fallback è source-specific perché usa self.movie_factors addestrati sulla sorgente corrente.
+        """
+        try:
+            # Recupera voti AFlix per l'utente
+            user_obj = Utente.objects(id=user_id).first()
+            if not user_obj:
+                return []
+
+            votes = list(Votazione.objects(utente=user_obj))
+            if not votes:
+                return []
+
+            # Assicurati di avere fattori film
+            if not hasattr(self, 'movie_factors') or self.movie_factors is None:
+                return []
+
+            # Precompute normalized movie_factors for cosine similarity
+            mf = np.asarray(self.movie_factors)
+            norms = np.linalg.norm(mf, axis=1, keepdims=True)
+            norms[norms == 0] = 1.0
+            mf_norm = mf / norms
+
+            # Map voti a indici nel movie_encoder (fuzzy se necessario)
+            encoded_titles = list(self.movie_encoder.classes_) if hasattr(self, 'movie_encoder') and self.movie_encoder is not None else []
+            from difflib import get_close_matches
+
+            rated_indices = set()
+            score_acc = {}
+            weight_acc = {}
+
+            for v in votes:
+                try:
+                    title = v.film.titolo
+                    rating_val = float(v.valutazione)
+                    mapped_title = None
+                    if encoded_titles and title in encoded_titles:
+                        mapped_title = title
+                    elif encoded_titles:
+                        matches = get_close_matches(title, encoded_titles, n=1, cutoff=0.6)
+                        if matches:
+                            mapped_title = matches[0]
+
+                    if not mapped_title:
+                        continue
+
+                    idx = int(self.movie_encoder.transform([mapped_title])[0])
+                    rated_indices.add(idx)
+
+                    # Similarities to all movies
+                    target_vec = mf_norm[idx].reshape(1, -1)
+                    sims = np.dot(mf_norm, target_vec.T).flatten()  # cosine similarities
+
+                    # Consider top_k neighbors (excluding itself)
+                    top_k = min(50, len(sims)-1)
+                    if top_k <= 0:
+                        continue
+                    neigh_idx = np.argpartition(-sims, range(1, top_k+1))[:top_k+1]
+                    # Aggregate weighted score: similarity * (rating - mean_bias)
+                    for ni in neigh_idx:
+                        if ni == idx:
+                            continue
+                        sim = float(sims[ni])
+                        score = sim * (rating_val - getattr(self, 'mean_rating_bias', 3.0))
+                        score_acc[ni] = score_acc.get(ni, 0.0) + score
+                        weight_acc[ni] = weight_acc.get(ni, 0.0) + abs(sim)
+                except Exception:
+                    continue
+
+            # Compute final scores
+            final_scores = []
+            for mi, s in score_acc.items():
+                w = weight_acc.get(mi, 1.0)
+                final_scores.append((mi, s / w if w != 0 else s))
+
+            if not final_scores:
+                return []
+
+            final_scores.sort(key=lambda x: x[1], reverse=True)
+
+            # Build recommendation objects, skip already rated indices
+            recs = []
+            for mi, sc in final_scores:
+                if mi in rated_indices:
+                    continue
+                try:
+                    title = self.movie_encoder.inverse_transform([mi])[0]
+                    film = Film.objects(titolo=title).first()
+                    if not film:
+                        continue
+                    poster_url = None
+                    if film.poster_path:
+                        poster_url = f"https://image.tmdb.org/t/p/w500{film.poster_path}"
+                    elif film.tmdb_id:
+                        poster_url = self.fetch_poster_url(film.tmdb_id)
+
+                    if not poster_url:
+                        continue
+
+                    recs.append({
+                        'title': title,
+                        'predicted_rating': float(min(5.0, max(1.0, getattr(self, 'mean_rating_bias', 3.0) + sc))),
+                        'tmdb_id': film.tmdb_id,
+                        'genres': film.genere,
+                        'poster_url': poster_url,
+                        'tmdb_rating': film.tmdb_rating,
+                        'cluster': int(self.cluster_labels[mi]) if self.cluster_labels is not None and mi < len(self.cluster_labels) else 0
+                    })
+                    if len(recs) >= top_n:
+                        break
+                except Exception:
+                    continue
+
+            return recs
+        except Exception as e:
+            logger.debug(f"Errore fallback_item_based_recommendations: {e}")
+            return []
+
+    def get_service_popular_recommendations(self, top_n: int = 10) -> List[Dict[str, Any]]:
+        """Restituisce le raccomandazioni popolari costruite dal dataset di training di questa istanza, se disponibili."""
+        # If we already built a per-service popular list, return it
+        if hasattr(self, '_service_popular_recommendations') and self._service_popular_recommendations:
+            return self._service_popular_recommendations[:top_n]
+
+        # Otherwise, try to build a lightweight popular list from the last generated training dataframe
+        try:
+            df = getattr(self, '_last_training_df', None)
+            if df is not None and len(df) > 0:
+                # Aggregate mean rating and counts per title
+                agg = df.groupby('title').agg({'rating': ['mean', 'count']})
+                agg.columns = ['mean_rating', 'count']
+                agg = agg.reset_index().sort_values(by=['mean_rating', 'count'], ascending=[False, False])
+
+                results = []
+                for _, row in agg.head(top_n).iterrows():
+                    title = row['title']
+                    results.append({
+                        'title': title,
+                        'predicted_rating': float(row['mean_rating']),
+                        'poster_url': None,
+                        'genres': [],
+                        'tmdb_id': None,
+                        'tmdb_rating': None,
+                        'cluster': 0
+                    })
+
+                # Cache it to avoid recomputation
+                try:
+                    self._service_popular_recommendations = results
+                except Exception:
+                    pass
+
+                return results
+        except Exception as e:
+            logger.debug(f"Could not build service-specific popular from last training df: {e}")
+
+        # Fallback: global DB popular
+        return self._get_popular_recommendations(top_n)
 
     def get_user_history(self, user_id: str) -> List[Dict[str, Any]]:
         """Recupera lo storico dei voti dell'utente"""
@@ -1400,42 +2260,95 @@ class MLRecommendationService:
             common_titles = aflix_titles.intersection(tmdb_titles)
             
             logger.info(f"Film AFlix: {len(aflix_titles)}, Film TMDB: {len(tmdb_titles)}, Comuni: {len(common_titles)}")
-            
-            if len(common_titles) < 2:
-                # Se non ci sono abbastanza film comuni, usa media dei fattori per inferenza
-                logger.warning("Pochi film comuni TMDB-AFlix, uso inferenza basata su media dei fattori")
-                
-                # Calcola fattori medi per ogni film AFlix basandoti sui generi o altre caratteristiche
-                aflix_movie_factors = []
-                avg_factor = np.mean(self.item_factors, axis=0)  # Fattore medio TMDB
-                
-                for title in aflix_titles:
-                    # Per ora usa il fattore medio, in futuro si può migliorare con content-based
-                    noise = np.random.normal(0, 0.1, avg_factor.shape)  # Piccola variazione
-                    aflix_movie_factors.append(avg_factor + noise)
-                
-                return np.array(aflix_movie_factors)
-            
-            else:
-                # Usa i fattori dei film comuni
-                aflix_movie_factors = []
-                aflix_movie_info = []
-                
-                for title in aflix_titles:
-                    if title in common_titles:
-                        # Film presente in TMDB, usa i suoi fattori
-                        movie_idx = self.movie_encoder.transform([title])[0]
-                        aflix_movie_factors.append(self.item_factors[movie_idx])
-                        aflix_movie_info.append({"title": title, "source": "tmdb_match"})
-                    else:
-                        # Film non in TMDB, usa fattore medio con rumore
-                        avg_factor = np.mean(self.item_factors, axis=0)
-                        noise = np.random.normal(0, 0.2, avg_factor.shape)
-                        aflix_movie_factors.append(avg_factor + noise)
-                        aflix_movie_info.append({"title": title, "source": "inferred"})
-                
-                self.aflix_movie_info = aflix_movie_info  # Salva per debug
-                return np.array(aflix_movie_factors)
+            # Costruisci lista codificata dei titoli noti
+            encoded_titles = list(self.movie_encoder.classes_)
+
+            def resolve_item_vector(title: str, genres: List[Any]):
+                # 1) exact
+                if title in self.movie_encoder.classes_:
+                    idx = int(self.movie_encoder.transform([title])[0])
+                    return self.item_factors[idx], 'exact'
+
+                # 2) fuzzy
+                matches = difflib.get_close_matches(title, encoded_titles, n=3, cutoff=0.72)
+                if matches:
+                    best = matches[0]
+                    idx = int(self.movie_encoder.transform([best])[0])
+                    return self.item_factors[idx], f'fuzzy:{best}'
+
+                # 3) genre overlap
+                if hasattr(self, 'train_movie_genres') and self.train_movie_genres:
+                    aflix_genre_set = set(genres) if genres else set()
+                    scores = []
+                    for cand in encoded_titles:
+                        cand_genres = set(self.train_movie_genres.get(cand, []))
+                        if not cand_genres:
+                            continue
+                        overlap = len(aflix_genre_set.intersection(cand_genres))
+                        if overlap > 0:
+                            scores.append((cand, overlap))
+                    if scores:
+                        scores.sort(key=lambda x: x[1], reverse=True)
+                        top = [s[0] for s in scores[:3]]
+                        idxs = self.movie_encoder.transform(top)
+                        vecs = self.item_factors[idxs]
+                        weights = np.array([s[1] for s in scores[:3]], dtype=float)
+                        weights /= weights.sum()
+                        return np.average(vecs, axis=0, weights=weights), f'genre_best:{top}'
+
+                # 4) partial similarity weighted average
+                from difflib import SequenceMatcher
+                ratios = []
+                for cand in encoded_titles:
+                    r = SequenceMatcher(None, title.lower(), cand.lower()).ratio()
+                    if r > 0.35:
+                        ratios.append((cand, r))
+                if ratios:
+                    ratios.sort(key=lambda x: x[1], reverse=True)
+                    top = [r[0] for r in ratios[:5]]
+                    idxs = self.movie_encoder.transform(top)
+                    vecs = self.item_factors[idxs]
+                    weights = np.array([r[1] for r in ratios[:5]], dtype=float)
+                    weights /= weights.sum()
+                    return np.average(vecs, axis=0, weights=weights), f'partial_sim:{[t for t in top]}'
+
+                # 5) fallback None
+                return None, 'none'
+
+            aflix_movie_factors = []
+            aflix_movie_info = []
+
+            # Manteniamo ordine coerente con aflix_titles list
+            for title in sorted(list(aflix_titles)):
+                # trova generi a partire dal dataframe (prendi primo match)
+                try:
+                    genres = list(aflix_df[aflix_df['title'] == title]['genres'].iloc[0]) if 'genres' in aflix_df.columns and len(aflix_df[aflix_df['title'] == title]) > 0 else []
+                except Exception:
+                    genres = []
+
+                vec, why = resolve_item_vector(title, genres)
+                if vec is None:
+                    # se non risolto, usa media item_factors con rumore maggiore per varianza
+                    avg_factor = np.mean(self.item_factors, axis=0)
+                    noise = np.random.normal(0, 0.2, avg_factor.shape)
+                    vec = avg_factor + noise
+                    why = 'fallback_mean_no_match'
+
+                aflix_movie_factors.append(vec)
+                aflix_movie_info.append({"title": title, "mapping": why})
+
+            self.aflix_movie_info = aflix_movie_info
+            # Log summary of mapping reasons
+            try:
+                counts = {}
+                for info in aflix_movie_info:
+                    key = info.get('mapping', 'unknown')
+                    counts[key] = counts.get(key, 0) + 1
+                logger.info(f"AFlix->SVD mapping summary: {counts}")
+            except Exception:
+                pass
+
+            return np.array(aflix_movie_factors)
                 
         except Exception as e:
             logger.error(f"Errore proiezione film AFlix: {e}")
@@ -1445,80 +2358,85 @@ class MLRecommendationService:
         """Valuta le performance del modello"""
         if not self.is_trained:
             return {"error": "Model not trained"}
-        
+
         try:
-            # Prepara dati per valutazione
+            # Prefer to evaluate the trained instance against real AFlix votes
+            # using the instance's learned item_factors / user_factors mapping.
+            aflix_result = self._test_on_aflix_data()
+
+            # If the class test returns usable predictions, use its RMSE
+            if isinstance(aflix_result, dict) and aflix_result.get('status') == 'success' and aflix_result.get('rmse') is not None:
+                return {
+                    "rmse": float(aflix_result.get('rmse')),
+                    "mae": float(aflix_result.get('mae')) if aflix_result.get('mae') is not None else None,
+                    "test_samples": int(aflix_result.get('test_samples', 0)),
+                    "train_samples": int(getattr(self, '_training_ratings_count', 0) or 0),
+                    "explained_variance": float(getattr(self, 'explained_variance', 0.0)),
+                    "model_status": "evaluated_aflix_test"
+                }
+
+            # Fallback: if _test_on_aflix_data could not produce predictions, run a local
+            # evaluation on a sampled AFlix subset (this was the previous behavior).
             df = self.prepare_data()
-            
-            if len(df) < 15:  # Abbassato da 20 a 15
+            if len(df) < 15:
                 return {
                     "error": f"Insufficient data for evaluation (minimum 15 votes required, current: {len(df)})",
                     "current_votes": len(df),
                     "required_votes": 15,
                     "model_status": "trained_but_not_evaluable"
                 }
-            
-            
-            # Campiona utenti per valutazione più veloce
+
             sample_users = df['userId'].value_counts().head(100).index
             sample_df = df[df['userId'].isin(sample_users)].copy()
-            
+
             # Re-encoding per il sample
             user_encoder_eval = LabelEncoder()
             movie_encoder_eval = LabelEncoder()
             sample_df['user_idx'] = user_encoder_eval.fit_transform(sample_df['userId'])
             sample_df['movie_idx'] = movie_encoder_eval.fit_transform(sample_df['title'])
-            
-            # Split train/test
+
             train_df, test_df = train_test_split(sample_df, test_size=0.2, random_state=42)
-            
-            # Training matrix
+
             train_matrix = csr_matrix(
                 (train_df['rating'], (train_df['user_idx'], train_df['movie_idx'])),
                 shape=(sample_df['user_idx'].nunique(), sample_df['movie_idx'].nunique())
             )
-            
-            # SVD per valutazione
+
             eval_components = min(30, min(train_matrix.shape) - 1)
-            eval_components = max(1, eval_components)  # Assicura almeno 1 componente
-            
+            eval_components = max(1, eval_components)
+
             svd_eval = TruncatedSVD(n_components=eval_components, random_state=42)
             user_factors_eval = svd_eval.fit_transform(train_matrix)
             movie_factors_eval = svd_eval.components_.T
-            
-            # Predizioni
+
             predictions, actuals = [], []
             for _, row in test_df.iterrows():
                 u, m = row['user_idx'], row['movie_idx']
                 if u < user_factors_eval.shape[0] and m < movie_factors_eval.shape[0]:
-                    pred = np.dot(user_factors_eval[u], movie_factors_eval[m])
-                    
-                    # Aggiungi bias rating medio e clamp nel range [1, 5]
-                    pred += 3.0  # Rating medio
+                    pred = float(np.dot(user_factors_eval[u], movie_factors_eval[m]))
+                    pred += 3.0
                     pred = max(1.0, min(5.0, pred))
-                    
                     predictions.append(pred)
                     actuals.append(row['rating'])
-            
+
             if len(predictions) == 0:
                 return {"error": "No valid predictions generated"}
-            
-            # Metriche
+
             rmse = float(np.sqrt(mean_squared_error(actuals, predictions)))
             mae = float(mean_absolute_error(actuals, predictions))
-            
+
             evaluation = {
                 "rmse": rmse,
                 "mae": mae,
                 "test_samples": len(predictions),
                 "train_samples": len(train_df),
-                "explained_variance": float(self.explained_variance),
-                "model_status": "evaluated"
+                "explained_variance": float(getattr(self, 'explained_variance', 0.0)),
+                "model_status": "evaluated_local"
             }
-            
-            logger.info(f"Model evaluation completed: RMSE={rmse:.4f}, MAE={mae:.4f}")
+
+            logger.info(f"Model evaluation completed (fallback local): RMSE={rmse:.4f}, MAE={mae:.4f}")
             return evaluation
-            
+
         except Exception as e:
             logger.error(f"Error evaluating model: {e}")
             return {"error": str(e)}
@@ -1577,6 +2495,9 @@ class MLRecommendationService:
             "variance_per_component": self.variance_per_component if hasattr(self, 'variance_per_component') else [],
             "k_optimization_available": len(self.k_performance_log) > 0 if hasattr(self, 'k_performance_log') else False,
             "total_ratings": total_ratings,
+            "training_source": getattr(self, 'training_source', None),
+            "last_trained_at": getattr(self, 'last_trained_at', None),
+            "instance_name": getattr(self, 'instance_name', None),
             # Debug info
             "debug": {
                 "svd_model_exists": self.svd_model is not None,
@@ -1953,26 +2874,39 @@ class MLRecommendationService:
             logger.error(f"Error generating k factor report: {e}")
             return {"error": str(e)}
 
-# Istanza globale del servizio
-ml_service = MLRecommendationService()
+# Creiamo due istanze del servizio ML: una per TMDB e una per OMDb
+ml_service_tmdb = MLRecommendationService()
+ml_service_omdb = MLRecommendationService()
 
-# ✅ RESET FORZATO parametri istanza globale  
+# Configura le istanze per la sorgente corretta
+ml_service_tmdb.use_tmdb_training = True
+ml_service_tmdb.use_omdb_training = False
+ml_service_tmdb.cache_dir = os.path.join('data', 'cache', 'tmdb')
+ml_service_tmdb.instance_name = 'tmdb'
+
+ml_service_omdb.use_tmdb_training = False
+ml_service_omdb.use_omdb_training = True
+ml_service_omdb.cache_dir = os.path.join('data', 'cache', 'omdb')
+ml_service_omdb.instance_name = 'omdb'
+
+def get_ml_service_for_source(source: Optional[str]):
+    """Restituisce l'istanza ML corretta in base alla sorgente ('tmdb' o 'omdb')."""
+    if source and str(source).lower() == 'omdb':
+        return ml_service_omdb
+    return ml_service_tmdb
+
+# Manteniamo ml_service per retrocompatibilità (usa TMDB)
+ml_service = ml_service_tmdb
+
 def reset_global_ml_service():
-    """Reset completo istanza globale ML"""
-    global ml_service
-    ml_service.n_components = 25
-    ml_service.current_k_factor = 25  
-    ml_service.n_clusters = 4
-    ml_service.k_svd_range = range(10, 51, 5)
-    ml_service.k_cluster_range = range(2, 8)
-    # Reset stato per forzare re-training
-    ml_service.is_trained = False
-    print("🔄 Parametri ML service resettati: K-SVD=25, K-Cluster=4")
+    """Reset basico per entrambe le istanze (usato in dev)."""
+    for svc in [ml_service_tmdb, ml_service_omdb]:
+        svc.n_components = 25
+        svc.current_k_factor = 25
+        svc.n_clusters = 4
+        svc.k_svd_range = range(10, 51, 5)
+        svc.k_cluster_range = range(2, 8)
+        svc.is_trained = False
 
-# Esegui reset immediato
+# Esegui reset immediato in avvio per sicurezza
 reset_global_ml_service()
-
-# Debug: Verifica parametri caricati
-print(f"🔧 DEBUG: n_components = {ml_service.n_components}")
-print(f"🔧 DEBUG: current_k_factor = {ml_service.current_k_factor}")
-print(f"🔧 DEBUG: k_svd_range = {list(ml_service.k_svd_range)}")
