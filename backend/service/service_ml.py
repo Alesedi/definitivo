@@ -71,6 +71,12 @@ class MLRecommendationService:
         self._service_popular_recommendations = []
         self.last_trained_at = None
 
+        # Baseline bias parameters (global mean + per-item and per-user biases)
+        self.bias_reg = 10.0  # regularization for bias estimation (lambda)
+        self.global_mean = None
+        self.item_bias = None  # numpy array indexed by movie_idx
+        self.user_bias = None  # numpy array indexed by user_idx
+
         # Placeholder poster used when no poster can be resolved for a title
         # Use a small, reliable placeholder image — change if you have a local asset
         self.default_poster_placeholder = "https://via.placeholder.com/500x750?text=No+Poster"
@@ -1049,7 +1055,50 @@ class MLRecommendationService:
         df['user_idx'] = self.user_encoder.fit_transform(df['userId'])
         df['movie_idx'] = self.movie_encoder.fit_transform(df['title'])
         
-        # Matrice sparsa
+        # Calcolo dei bias baseline (mu, b_i, b_u) usando regolarizzazione
+        try:
+            mu = float(df['rating'].mean()) if len(df) > 0 else 0.0
+            lam = float(getattr(self, 'bias_reg', 10.0))
+
+            n_users = df['user_idx'].nunique()
+            n_movies = df['movie_idx'].nunique()
+
+            # item bias b_i: sum(r_ui - mu) / (N_i + lambda)
+            item_group = df.groupby('movie_idx').agg(sum_diff=('rating', lambda x: (x - mu).sum()), count=('rating', 'count'))
+            b_i_series = item_group['sum_diff'] / (item_group['count'] + lam)
+
+            # map b_i to rows for user bias calculation
+            b_i_map = df['movie_idx'].map(b_i_series.to_dict())
+            df = df.copy()
+            df['b_i'] = b_i_map.fillna(0.0)
+
+            # user bias b_u: sum(r_ui - mu - b_i) / (N_u + lambda)
+            user_group = df.groupby('user_idx').agg(sum_diff=('rating', lambda x: (x - mu - df.loc[x.index, 'b_i']).sum()), count=('rating', 'count'))
+            b_u_series = user_group['sum_diff'] / (user_group['count'] + lam)
+
+            # Costruisci array finali per accesso veloce
+            item_bias_arr = np.zeros(n_movies, dtype=float)
+            for idx, val in b_i_series.items():
+                if 0 <= int(idx) < n_movies:
+                    item_bias_arr[int(idx)] = float(val)
+
+            user_bias_arr = np.zeros(n_users, dtype=float)
+            for idx, val in b_u_series.items():
+                if 0 <= int(idx) < n_users:
+                    user_bias_arr[int(idx)] = float(val)
+
+            self.global_mean = mu
+            self.item_bias = item_bias_arr
+            self.user_bias = user_bias_arr
+
+            logger.info(f"Bias baseline calcolati: mu={self.global_mean:.3f}, users={n_users}, movies={n_movies}")
+        except Exception as e:
+            logger.warning(f"Errore calcolo bias baseline: {e}")
+            # fallback
+            self.global_mean = float(df['rating'].mean()) if len(df) > 0 else 3.0
+            self.item_bias = np.zeros(df['movie_idx'].nunique() if 'movie_idx' in df else 0)
+            self.user_bias = np.zeros(df['user_idx'].nunique() if 'user_idx' in df else 0)
+
         return csr_matrix(
             (df['rating'], (df['user_idx'], df['movie_idx'])),
             shape=(df['user_idx'].nunique(), df['movie_idx'].nunique())
@@ -1079,7 +1128,7 @@ class MLRecommendationService:
                     # 1) Exact match
                     if aflix_title in self.movie_encoder.classes_:
                         idx = int(self.movie_encoder.transform([aflix_title])[0])
-                        return self.item_factors[idx], 'exact'
+                        return self.item_factors[idx], 'exact', idx
 
                     # 2) Fuzzy match
                     matches = difflib.get_close_matches(aflix_title, encoded_titles, n=3, cutoff=0.7)
@@ -1088,7 +1137,7 @@ class MLRecommendationService:
                         best = matches[0]
                         idx = int(self.movie_encoder.transform([best])[0])
                         logger.debug(f"Fuzzy match: '{aflix_title}' -> '{best}'")
-                        return self.item_factors[idx], f'fuzzy:{best}'
+                        return self.item_factors[idx], f'fuzzy:{best}', idx
 
                     # 3) Genre-overlap: richiede mapping titolo->generi generato durante build dataset
                     if hasattr(self, 'train_movie_genres') and self.train_movie_genres:
@@ -1111,7 +1160,8 @@ class MLRecommendationService:
                             vecs = self.item_factors[idxs]
                             weights = np.array([s for _, s in best_scores[:3]], dtype=float)
                             weights /= weights.sum()
-                            return np.average(vecs, axis=0, weights=weights), f'genre_best:{top}'
+                            # ritorniamo vettore medio; idx non singolo (None)
+                            return np.average(vecs, axis=0, weights=weights), f'genre_best:{top}', None
 
                     # 4) Ultimo fallback: media pesata dei primi N item_factors per similarità di titolo (partial)
                     # Usa similarity via difflib.SequenceMatcher ratio su tutti i titoli
@@ -1128,13 +1178,13 @@ class MLRecommendationService:
                         vecs = self.item_factors[idxs]
                         weights = np.array([r[1] for r in ratios[:5]], dtype=float)
                         weights /= weights.sum()
-                        return np.average(vecs, axis=0, weights=weights), f'partial_sim:{[t for t in top]}'
+                        return np.average(vecs, axis=0, weights=weights), f'partial_sim:{[t for t in top]}', None
 
                     # Se tutto fallisce, None
-                    return None, 'none'
+                    return None, 'none', None
                 except Exception as e:
                     logger.debug(f"Errore resolving factor per '{aflix_title}': {e}")
-                    return None, 'error'
+                    return None, 'error', None
 
             # Costruiamo test set e predizioni
             predictions = []
@@ -1145,7 +1195,7 @@ class MLRecommendationService:
                 try:
                     title = row['title']
                     aflix_genres = row.get('genres', []) if isinstance(row.get('genres', []), list) else []
-                    item_vec, why = resolve_title_to_item_factor(title, aflix_genres)
+                    item_vec, why, mapped_idx = resolve_title_to_item_factor(title, aflix_genres)
                     mapping_counts[why] = mapping_counts.get(why, 0) + 1
                     if item_vec is None:
                         # Non possiamo predire per questo film
@@ -1153,8 +1203,17 @@ class MLRecommendationService:
 
                     # Usa vettore utente medio se l'utente non è nel training
                     avg_user_factor = np.mean(self.user_factors, axis=0)
-                    pred_rating = float(np.dot(avg_user_factor, item_vec))
-                    pred_rating += getattr(self, 'mean_rating_bias', 3.0)
+                    base_pred = float(np.dot(avg_user_factor, item_vec))
+                    # Aggiungi baseline: global mean + item bias (se disponibile)
+                    global_mean = getattr(self, 'global_mean', getattr(self, 'mean_rating_bias', 3.0))
+                    item_b = 0.0
+                    try:
+                        if mapped_idx is not None and self.item_bias is not None and mapped_idx < len(self.item_bias):
+                            item_b = float(self.item_bias[int(mapped_idx)])
+                    except Exception:
+                        item_b = 0.0
+
+                    pred_rating = base_pred + global_mean + item_b
                     pred_rating = max(1.0, min(5.0, pred_rating))
 
                     predictions.append(pred_rating)
@@ -1612,8 +1671,27 @@ class MLRecommendationService:
                 logger.info(f"User {user_id}: inferred user vector available (len={len(inferred_user_vector)}) - generating personalized recommendations")
 
             # Calcola rating predetti usando il vettore utente (reale o inferito)
-            predicted_ratings = np.dot(self.movie_factors, inferred_user_vector)
-            predicted_ratings = np.clip(predicted_ratings, 0.5, 5.0)
+            base_preds = np.dot(self.movie_factors, inferred_user_vector)
+
+            # Aggiungi baseline: global mean + item_bias + user_bias (se disponibile)
+            global_mean = getattr(self, 'global_mean', getattr(self, 'mean_rating_bias', 3.0))
+            item_bias_arr = getattr(self, 'item_bias', None)
+
+            # Se l'utente è nel training, recupera user_bias, altrimenti 0
+            user_bias_scalar = 0.0
+            try:
+                if user_id in self.user_encoder.classes_:
+                    user_idx = int(self.user_encoder.transform([user_id])[0])
+                    if self.user_bias is not None and user_idx < len(self.user_bias):
+                        user_bias_scalar = float(self.user_bias[user_idx])
+            except Exception:
+                user_bias_scalar = 0.0
+
+            if item_bias_arr is None:
+                item_bias_arr = np.zeros_like(base_preds)
+
+            predicted_ratings = base_preds + global_mean + item_bias_arr + user_bias_scalar
+            predicted_ratings = np.clip(predicted_ratings, 1.0, 5.0)
             
             # Converti in raccomandazioni
             movie_titles = self.movie_encoder.inverse_transform(np.arange(len(predicted_ratings)))
@@ -1911,11 +1989,22 @@ class MLRecommendationService:
                         continue
                     neigh_idx = np.argpartition(-sims, range(1, top_k+1))[:top_k+1]
                     # Aggregate weighted score: similarity * (rating - mean_bias)
+                    # baseline components
+                    global_mean = getattr(self, 'global_mean', getattr(self, 'mean_rating_bias', 3.0))
                     for ni in neigh_idx:
                         if ni == idx:
                             continue
                         sim = float(sims[ni])
-                        score = sim * (rating_val - getattr(self, 'mean_rating_bias', 3.0))
+                        # tenta di sottrarre global mean e item bias del film votato
+                        item_b_voted = 0.0
+                        try:
+                            if self.item_bias is not None and int(idx) < len(self.item_bias):
+                                item_b_voted = float(self.item_bias[int(idx)])
+                        except Exception:
+                            item_b_voted = 0.0
+
+                        residual = rating_val - global_mean - item_b_voted
+                        score = sim * residual
                         score_acc[ni] = score_acc.get(ni, 0.0) + score
                         weight_acc[ni] = weight_acc.get(ni, 0.0) + abs(sim)
                 except Exception:
